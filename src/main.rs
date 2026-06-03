@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-        DefaultBodyLimit, Multipart, Path as AxumPath,
+        DefaultBodyLimit, Multipart, Path as AxumPath, Query,
     },
     http::{header, HeaderValue, Method, StatusCode},
     response::IntoResponse,
@@ -132,6 +132,99 @@ const AUTH_COOKIE_NAME: &str = "zali_auth";
 fn sqlite_literal(path: &Path) -> String {
     let escaped = path.to_string_lossy().replace('\'', "''");
     format!("'{}'", escaped)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{:02x}", byte);
+    }
+    out
+}
+
+fn asset_root_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("assets")
+}
+
+fn user_avatar_asset_dir(data_dir: &Path, username: &str) -> PathBuf {
+    asset_root_dir(data_dir)
+        .join("avatars")
+        .join(hex_encode(username.trim().as_bytes()))
+}
+
+fn server_asset_dir(data_dir: &Path, server_id: &str) -> PathBuf {
+    asset_root_dir(data_dir)
+        .join("servers")
+        .join(hex_encode(server_id.trim().as_bytes()))
+}
+
+fn asset_file_paths(base_dir: PathBuf, kind: &str) -> (PathBuf, PathBuf) {
+    (base_dir.join(format!("{}.bin", kind)), base_dir.join(format!("{}.json", kind)))
+}
+
+async fn read_asset_file(base_dir: PathBuf, kind: &str) -> Result<Option<(String, Vec<u8>, Option<DateTime<Utc>>)>, std::io::Error> {
+    let (bin_path, meta_path) = asset_file_paths(base_dir, kind);
+    if !fs::try_exists(&bin_path).await.unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let data = fs::read(&bin_path).await?;
+    if data.is_empty() {
+        return Ok(None);
+    }
+
+    let mime = match fs::read_to_string(&meta_path).await {
+        Ok(raw) => serde_json::from_str::<StoredAssetMeta>(&raw)
+            .map(|meta| meta.mime_type)
+            .unwrap_or_else(|_| "application/octet-stream".to_string()),
+        Err(_) => "application/octet-stream".to_string(),
+    };
+    let updated_at = match fs::read_to_string(&meta_path).await {
+        Ok(raw) => serde_json::from_str::<StoredAssetMeta>(&raw)
+            .ok()
+            .and_then(|meta| meta.updated_at),
+        Err(_) => None,
+    };
+
+    Ok(Some((mime, data, updated_at)))
+}
+
+async fn write_asset_file(
+    base_dir: PathBuf,
+    kind: &str,
+    mime_type: &str,
+    data: &[u8],
+    updated_at: Option<DateTime<Utc>>,
+) -> Result<(), std::io::Error> {
+    let (bin_path, meta_path) = asset_file_paths(base_dir, kind);
+    if let Some(parent) = bin_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(&bin_path, data).await?;
+    let meta = StoredAssetMeta {
+        mime_type: mime_type.to_string(),
+        updated_at,
+    };
+    let meta_json = serde_json::to_string_pretty(&meta).unwrap_or_else(|_| {
+        serde_json::json!({ "mime_type": mime_type, "updated_at": updated_at.map(|dt| dt.to_rfc3339()) }).to_string()
+    });
+    fs::write(&meta_path, meta_json).await?;
+    Ok(())
+}
+
+async fn clear_asset_file(base_dir: PathBuf, kind: &str) -> Result<(), std::io::Error> {
+    let (bin_path, meta_path) = asset_file_paths(base_dir, kind);
+    let _ = fs::remove_file(&bin_path).await;
+    let _ = fs::remove_file(&meta_path).await;
+    if let Some(parent) = bin_path.parent() {
+        if let Ok(mut rd) = fs::read_dir(parent).await {
+            if rd.next_entry().await?.is_none() {
+                let _ = fs::remove_dir(parent).await;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn canonical_data_dir() -> PathBuf {
@@ -267,6 +360,65 @@ async fn migrate_legacy_storage(
             }
         }
         Err(e) => warn!("Не удалось скопировать legacy uploads: {}", e),
+    }
+
+    Ok(())
+}
+
+async fn migrate_asset_files(pool: &SqlitePool, data_dir: &Path) -> Result<(), sqlx::Error> {
+    let assets_dir = asset_root_dir(data_dir);
+    fs::create_dir_all(assets_dir.join("avatars")).await.map_err(sqlx::Error::Io)?;
+    fs::create_dir_all(assets_dir.join("servers")).await.map_err(sqlx::Error::Io)?;
+
+    let avatars: Vec<AvatarRecord> = sqlx::query_as(
+        "SELECT username, mime_type, data, updated_at FROM avatars WHERE data IS NOT NULL AND length(data) > 0",
+    )
+    .fetch_all(pool)
+    .await?;
+    for avatar in avatars {
+        let dir = user_avatar_asset_dir(data_dir, &avatar.username);
+        if let Ok(Some((mime, data, _))) = read_asset_file(dir.clone(), "avatar").await {
+            if !mime.is_empty() && !data.is_empty() {
+                continue;
+            }
+        }
+        write_asset_file(
+            dir,
+            "avatar",
+            &avatar.mime_type,
+            &avatar.data,
+            Some(avatar.updated_at),
+        )
+        .await
+        .map_err(sqlx::Error::Io)?;
+    }
+
+    let servers: Vec<(String, Option<String>, Option<Vec<u8>>, Option<String>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT id, avatar_mime, avatar_data, banner_mime, banner_data FROM servers",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (server_id, avatar_mime, avatar_data, banner_mime, banner_data) in servers {
+        if let (Some(mime), Some(data)) = (avatar_mime.as_ref(), avatar_data.as_ref()) {
+            let dir = server_asset_dir(data_dir, &server_id);
+            if fs::try_exists(&asset_file_paths(dir.clone(), "avatar").0).await.unwrap_or(false) {
+                // already migrated
+            } else {
+                write_asset_file(dir.clone(), "avatar", mime, data, None)
+                    .await
+                    .map_err(sqlx::Error::Io)?;
+            }
+        }
+        if let (Some(mime), Some(data)) = (banner_mime.as_ref(), banner_data.as_ref()) {
+            let dir = server_asset_dir(data_dir, &server_id);
+            if fs::try_exists(&asset_file_paths(dir.clone(), "banner").0).await.unwrap_or(false) {
+                // already migrated
+            } else {
+                write_asset_file(dir, "banner", mime, data, None)
+                    .await
+                    .map_err(sqlx::Error::Io)?;
+            }
+        }
     }
 
     Ok(())
@@ -750,6 +902,19 @@ struct ServerAssetPayload {
     data_url: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct MessagePageQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredAssetMeta {
+    mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_at: Option<DateTime<Utc>>,
+}
+
 // ============================================================
 // MAIN
 // ============================================================
@@ -758,7 +923,10 @@ struct ServerAssetPayload {
 async fn main() {
     // Structured logging
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("zali_server=trace,tower_http=trace"))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("zali_server=info,tower_http=warn")),
+        )
         .init();
 
     let config = Config::from_env();
@@ -1082,6 +1250,9 @@ async fn main() {
     if let Err(e) = migrate_legacy_storage(&pool, &db_path, &uploads_dir).await {
         warn!("Миграция legacy storage завершилась с ошибкой: {}", e);
     }
+    if let Err(e) = migrate_asset_files(&pool, &data_dir).await {
+        warn!("Миграция asset storage завершилась с ошибкой: {}", e);
+    }
 
     seed_default_servers(&pool).await.ok();
     sqlx::query(
@@ -1185,7 +1356,34 @@ async fn main() {
     info!("🚀 Zali Server запущен на http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = async {
+                if let Some(ref mut stream) = sigterm {
+                    let _ = stream.recv().await;
+                }
+            } => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    info!("Получен сигнал завершения, сервер останавливается gracefully");
 }
 
 // ============================================================
@@ -1419,14 +1617,117 @@ async fn load_visible_channels_for_server(
     server_id: &str,
     viewer: &str,
 ) -> Result<Vec<ChannelResponse>, sqlx::Error> {
+    let server = match get_server_accessibility(pool, server_id).await? {
+        Some(server) => server,
+        None => return Ok(Vec::new()),
+    };
+    if server.owner == viewer {
+        return load_channels_for_server(pool, server_id).await;
+    }
+
+    let role = get_server_member_role(pool, server_id, viewer).await?;
+    if role.is_none() {
+        if server.is_public == 0 {
+            return Ok(Vec::new());
+        }
+        return load_channels_for_server(pool, server_id).await;
+    }
+
+    let viewer_role = role.unwrap_or_else(|| "member".to_string());
     let channels = load_channels_for_server(pool, server_id).await?;
+    let channel_permissions = load_channel_permissions_map(pool, server_id).await?;
+    let server_permissions = load_server_role_permissions_map(pool, server_id).await?;
     let mut visible = Vec::new();
     for channel in channels {
-        if can_access_channel(pool, server_id, &channel.id, viewer, "view").await.unwrap_or(false) {
+        if channel_allows_action(
+            &channel_permissions,
+            &server_permissions,
+            &viewer_role,
+            &channel.id,
+            "view",
+        ) {
             visible.push(channel);
         }
     }
     Ok(visible)
+}
+
+async fn load_server_role_permissions_map(
+    pool: &SqlitePool,
+    server_id: &str,
+) -> Result<HashMap<String, (bool, bool, bool)>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, ServerRoleRecord>(
+        "SELECT server_id, role_id, name, color, can_view, can_send, can_manage, can_manage_channels, can_manage_roles, can_invite, can_attach, can_embed, can_react, can_pin, can_mention, can_voice, can_kick, can_ban, position, created_at
+         FROM server_roles
+         WHERE server_id = ?",
+    )
+    .bind(server_id)
+    .fetch_all(pool)
+    .await?;
+    let mut map = HashMap::new();
+    for role in rows {
+        map.insert(
+            role.role_id.clone(),
+            (role.can_view != 0, role.can_send != 0, role.can_manage != 0),
+        );
+    }
+    map.entry("admin".to_string()).or_insert((true, true, true));
+    map.entry("member".to_string()).or_insert((true, true, false));
+    map.entry("owner".to_string()).or_insert((true, true, true));
+    Ok(map)
+}
+
+async fn load_channel_permissions_map(
+    pool: &SqlitePool,
+    server_id: &str,
+) -> Result<HashMap<String, HashMap<String, (bool, bool, bool)>>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, ChannelPermissionRecord>(
+        "SELECT cp.channel_id, cp.role, cp.can_view, cp.can_send, cp.can_manage, cp.updated_at
+         FROM channel_permissions cp
+         INNER JOIN channels c ON c.id = cp.channel_id
+         WHERE c.server_id = ?
+         ORDER BY cp.role ASC",
+    )
+    .bind(server_id)
+    .fetch_all(pool)
+    .await?;
+    let mut map: HashMap<String, HashMap<String, (bool, bool, bool)>> = HashMap::new();
+    for row in rows {
+        map.entry(row.channel_id)
+            .or_default()
+            .insert(row.role, (row.can_view != 0, row.can_send != 0, row.can_manage != 0));
+    }
+    Ok(map)
+}
+
+fn channel_allows_action(
+    channel_permissions: &HashMap<String, HashMap<String, (bool, bool, bool)>>,
+    server_permissions: &HashMap<String, (bool, bool, bool)>,
+    role: &str,
+    channel_id: &str,
+    action: &str,
+) -> bool {
+    if let Some(perms) = channel_permissions.get(channel_id) {
+        if let Some((can_view, can_send, can_manage)) = perms.get(role) {
+            return match action {
+                "view" => *can_view,
+                "send" => *can_send,
+                "manage" => *can_manage,
+                _ => false,
+            };
+        }
+    }
+    let fallback = server_permissions
+        .get(role)
+        .copied()
+        .or_else(|| server_permissions.get("member").copied())
+        .unwrap_or((true, true, false));
+    match action {
+        "view" => fallback.0,
+        "send" => fallback.1,
+        "manage" => fallback.2,
+        _ => false,
+    }
 }
 
 fn normalize_channel_kind(kind: Option<&str>) -> String {
@@ -1544,9 +1845,21 @@ fn normalize_data_url(value: &str) -> Result<(String, Vec<u8>), &'static str> {
 
 async fn get_server_asset(
     pool: &SqlitePool,
+    data_dir: &Path,
     server_id: &str,
     kind: &str,
 ) -> Result<Option<(String, Vec<u8>)>, sqlx::Error> {
+    if kind != "avatar" && kind != "banner" {
+        return Ok(None);
+    }
+
+    let dir = server_asset_dir(data_dir, server_id);
+    if let Ok(Some((mime, data, _))) = read_asset_file(dir.clone(), kind).await {
+        if !mime.is_empty() && !data.is_empty() {
+            return Ok(Some((mime, data)));
+        }
+    }
+
     let row = match kind {
         "avatar" => sqlx::query("SELECT avatar_mime, avatar_data FROM servers WHERE id = ? LIMIT 1")
             .bind(server_id)
@@ -1558,23 +1871,34 @@ async fn get_server_asset(
             .await?,
         _ => return Ok(None),
     };
-    Ok(row.and_then(|r| {
+    let asset = row.and_then(|r| {
         let mime: Option<String> = r.try_get(0).ok();
         let data: Option<Vec<u8>> = r.try_get(1).ok();
         match (mime, data) {
             (Some(m), Some(d)) if !d.is_empty() => Some((m, d)),
             _ => None,
         }
-    }))
+    });
+
+    if let Some((mime, data)) = asset.as_ref() {
+        let _ = write_asset_file(dir, kind, mime, data, None).await;
+    }
+
+    Ok(asset)
 }
 
 async fn set_server_asset(
     pool: &SqlitePool,
+    data_dir: &Path,
     server_id: &str,
     kind: &str,
     data_url: &str,
 ) -> Result<(), sqlx::Error> {
     let (mime, data) = normalize_data_url(data_url).map_err(|_| sqlx::Error::RowNotFound)?;
+    let dir = server_asset_dir(data_dir, server_id);
+    write_asset_file(dir, kind, &mime, &data, None)
+        .await
+        .map_err(sqlx::Error::Io)?;
     match kind {
         "avatar" => {
             sqlx::query("UPDATE servers SET avatar_mime = ?, avatar_data = ? WHERE id = ?")
@@ -1599,9 +1923,12 @@ async fn set_server_asset(
 
 async fn clear_server_asset(
     pool: &SqlitePool,
+    data_dir: &Path,
     server_id: &str,
     kind: &str,
 ) -> Result<(), sqlx::Error> {
+    let dir = server_asset_dir(data_dir, server_id);
+    let _ = clear_asset_file(dir, kind).await;
     match kind {
         "avatar" => {
             sqlx::query("UPDATE servers SET avatar_mime = NULL, avatar_data = NULL WHERE id = ?")
@@ -1640,6 +1967,22 @@ async fn load_channel_permissions(pool: &SqlitePool, channel_id: &str) -> Result
             canManage: row.can_manage != 0,
         })
         .collect())
+}
+
+async fn load_channel_permission_record(
+    pool: &SqlitePool,
+    channel_id: &str,
+    role: &str,
+) -> Result<Option<ChannelPermissionRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChannelPermissionRecord>(
+        "SELECT channel_id, role, can_view, can_send, can_manage, updated_at
+         FROM channel_permissions
+         WHERE channel_id = ? AND role = ? LIMIT 1",
+    )
+    .bind(channel_id)
+    .bind(role)
+    .fetch_optional(pool)
+    .await
 }
 
 async fn load_server_roles(pool: &SqlitePool, server_id: &str) -> Result<Vec<ServerRoleResponse>, sqlx::Error> {
@@ -1957,7 +2300,7 @@ async fn upsert_channel_permissions(
 async fn can_access_channel(
     pool: &SqlitePool,
     server_id: &str,
-    _channel_id: &str,
+    channel_id: &str,
     user: &str,
     action: &str,
 ) -> Result<bool, sqlx::Error> {
@@ -1974,6 +2317,14 @@ async fn can_access_channel(
     }
 
     let role_key = role.as_deref().unwrap_or("member");
+    if let Some(channel_role) = load_channel_permission_record(pool, channel_id, role_key).await? {
+        return Ok(match action {
+            "view" => channel_role.can_view != 0,
+            "send" => channel_role.can_send != 0,
+            "manage" => channel_role.can_manage != 0,
+            _ => false,
+        });
+    }
     let (can_view, can_send, can_manage) = load_server_role_permissions(pool, server_id, role_key).await?;
     Ok(match action {
         "view" => can_view,
@@ -2921,7 +3272,13 @@ async fn login(
             )
                 .into_response();
         }
-        attempts.push_back(now);
+        if attempts.is_empty() {
+            drop(attempts);
+            state.login_attempts.remove(&rate_key);
+            state.login_attempts.entry(rate_key.clone()).or_default().push_back(now);
+        } else {
+            attempts.push_back(now);
+        }
     }
 
     let row = sqlx::query("SELECT username, password_hash FROM users WHERE username = ?")
@@ -3240,10 +3597,10 @@ async fn create_server(
                 }
             }
             if let Some(avatar_data_url) = avatar_data_url.as_deref() {
-                let _ = set_server_asset(&state.db, &server.id, "avatar", avatar_data_url).await;
+                let _ = set_server_asset(&state.db, &state.data_dir, &server.id, "avatar", avatar_data_url).await;
             }
             if let Some(banner_data_url) = banner_data_url.as_deref() {
-                let _ = set_server_asset(&state.db, &server.id, "banner", banner_data_url).await;
+                let _ = set_server_asset(&state.db, &state.data_dir, &server.id, "banner", banner_data_url).await;
             }
 
             let default_channels = [
@@ -3662,12 +4019,12 @@ async fn update_server(
     }
 
     if let Some(avatar_data_url) = payload.avatar_data_url.as_deref() {
-        if let Err(e) = set_server_asset(&state.db, &server_id, "avatar", avatar_data_url).await {
+        if let Err(e) = set_server_asset(&state.db, &state.data_dir, &server_id, "avatar", avatar_data_url).await {
             error!("Ошибка обновления аватара сервера {}: {}", server_id, e);
         }
     }
     if let Some(banner_data_url) = payload.banner_data_url.as_deref() {
-        if let Err(e) = set_server_asset(&state.db, &server_id, "banner", banner_data_url).await {
+        if let Err(e) = set_server_asset(&state.db, &state.data_dir, &server_id, "banner", banner_data_url).await {
             error!("Ошибка обновления баннера сервера {}: {}", server_id, e);
         }
     }
@@ -3865,8 +4222,8 @@ async fn delete_server(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let messages = match sqlx::query_as::<_, Message>(
-        "SELECT id, sender, receiver, filename, timestamp, server_id, channel_id
+    let filenames = match sqlx::query_scalar::<_, String>(
+        "SELECT filename
          FROM messages
          WHERE server_id = ?",
     )
@@ -3881,8 +4238,8 @@ async fn delete_server(
         }
     };
 
-    for msg in &messages {
-        let path = state.uploads_dir.join(&msg.filename);
+    for filename in &filenames {
+        let path = state.uploads_dir.join(filename);
         let _ = fs::remove_file(&path).await;
     }
 
@@ -4031,7 +4388,7 @@ async fn get_server_avatar(
         }
     }
 
-    match get_server_asset(&state.db, &server_id, "avatar").await {
+    match get_server_asset(&state.db, &state.data_dir, &server_id, "avatar").await {
         Ok(Some((mime, data))) => (
             [
                 (axum::http::header::CONTENT_TYPE, mime.as_str()),
@@ -4061,7 +4418,7 @@ async fn set_server_avatar(
     if payload.data_url.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "data_url обязателен").into_response();
     }
-    if let Err(e) = set_server_asset(&state.db, &server_id, "avatar", &payload.data_url).await {
+    if let Err(e) = set_server_asset(&state.db, &state.data_dir, &server_id, "avatar", &payload.data_url).await {
         error!("Ошибка сохранения аватара сервера {}: {}", server_id, e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -4076,7 +4433,7 @@ async fn delete_server_avatar(
     if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if let Err(e) = clear_server_asset(&state.db, &server_id, "avatar").await {
+    if let Err(e) = clear_server_asset(&state.db, &state.data_dir, &server_id, "avatar").await {
         error!("Ошибка удаления аватара сервера {}: {}", server_id, e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -4097,7 +4454,7 @@ async fn get_server_banner(
         }
     }
 
-    match get_server_asset(&state.db, &server_id, "banner").await {
+    match get_server_asset(&state.db, &state.data_dir, &server_id, "banner").await {
         Ok(Some((mime, data))) => (
             [
                 (axum::http::header::CONTENT_TYPE, mime.as_str()),
@@ -4127,7 +4484,7 @@ async fn set_server_banner(
     if payload.data_url.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "data_url обязателен").into_response();
     }
-    if let Err(e) = set_server_asset(&state.db, &server_id, "banner", &payload.data_url).await {
+    if let Err(e) = set_server_asset(&state.db, &state.data_dir, &server_id, "banner", &payload.data_url).await {
         error!("Ошибка сохранения баннера сервера {}: {}", server_id, e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -4142,7 +4499,7 @@ async fn delete_server_banner(
     if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if let Err(e) = clear_server_asset(&state.db, &server_id, "banner").await {
+    if let Err(e) = clear_server_asset(&state.db, &state.data_dir, &server_id, "banner").await {
         error!("Ошибка удаления баннера сервера {}: {}", server_id, e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -4358,6 +4715,7 @@ async fn update_channel_permissions(
 
 async fn get_server_messages(
     AxumPath((server_id, channel_id)): AxumPath<(String, String)>,
+    Query(page): Query<MessagePageQuery>,
     AuthenticatedUser(auth_user): AuthenticatedUser,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -4374,16 +4732,31 @@ async fn get_server_messages(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    match sqlx::query_as::<_, Message>(
-        "SELECT id, client_id, sender, receiver, filename, timestamp, server_id, channel_id
-         FROM messages
-         WHERE server_id = ? AND channel_id = ?
-         ORDER BY timestamp ASC",
-    )
-    .bind(&server_id)
-    .bind(&channel_id)
-    .fetch_all(&state.db)
-    .await
+    let limit = page.limit.unwrap_or(0).clamp(0, 500) as i64;
+    let offset = page.offset.unwrap_or(0).max(0) as i64;
+    let query = if limit > 0 {
+        sqlx::query_as::<_, Message>(
+            "SELECT id, client_id, sender, receiver, filename, timestamp, server_id, channel_id
+             FROM messages
+             WHERE server_id = ? AND channel_id = ?
+             ORDER BY timestamp ASC, id ASC
+             LIMIT ? OFFSET ?",
+        )
+        .bind(&server_id)
+        .bind(&channel_id)
+        .bind(limit)
+        .bind(offset)
+    } else {
+        sqlx::query_as::<_, Message>(
+            "SELECT id, client_id, sender, receiver, filename, timestamp, server_id, channel_id
+             FROM messages
+             WHERE server_id = ? AND channel_id = ?
+             ORDER BY timestamp ASC, id ASC",
+        )
+        .bind(&server_id)
+        .bind(&channel_id)
+    };
+    match query.fetch_all(&state.db).await
     {
         Ok(msgs) => {
             info!(
@@ -4437,6 +4810,7 @@ async fn get_server_messages(
 
 async fn get_messages(
     AxumPath(user): AxumPath<String>,
+    Query(page): Query<MessagePageQuery>,
     AuthenticatedUser(auth_user): AuthenticatedUser,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -4449,16 +4823,31 @@ async fn get_messages(
         );
     }
 
-    match sqlx::query_as::<_, Message>(
-        "SELECT id, client_id, sender, receiver, filename, timestamp, server_id, channel_id
-         FROM messages
-         WHERE server_id IS NULL AND (receiver = ? OR sender = ?)
-         ORDER BY timestamp ASC",
-    )
-    .bind(&effective_user)
-    .bind(&effective_user)
-    .fetch_all(&state.db)
-    .await
+    let limit = page.limit.unwrap_or(0).clamp(0, 500) as i64;
+    let offset = page.offset.unwrap_or(0).max(0) as i64;
+    let query = if limit > 0 {
+        sqlx::query_as::<_, Message>(
+            "SELECT id, client_id, sender, receiver, filename, timestamp, server_id, channel_id
+             FROM messages
+             WHERE server_id IS NULL AND (receiver = ? OR sender = ?)
+             ORDER BY timestamp ASC, id ASC
+             LIMIT ? OFFSET ?",
+        )
+        .bind(&effective_user)
+        .bind(&effective_user)
+        .bind(limit)
+        .bind(offset)
+    } else {
+        sqlx::query_as::<_, Message>(
+            "SELECT id, client_id, sender, receiver, filename, timestamp, server_id, channel_id
+             FROM messages
+             WHERE server_id IS NULL AND (receiver = ? OR sender = ?)
+             ORDER BY timestamp ASC, id ASC",
+        )
+        .bind(&effective_user)
+        .bind(&effective_user)
+    };
+    match query.fetch_all(&state.db).await
     {
         Ok(msgs) => {
             info!(
@@ -4595,6 +4984,19 @@ async fn get_avatar(
     AuthenticatedUser(_auth_user): AuthenticatedUser,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    let file_dir = user_avatar_asset_dir(&state.data_dir, &username);
+    if let Ok(Some((mime, data, _))) = read_asset_file(file_dir.clone(), "avatar").await {
+        return (
+            [
+                (axum::http::header::CONTENT_TYPE, mime.as_str()),
+                (axum::http::header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+                (axum::http::header::PRAGMA, "no-cache"),
+            ],
+            data,
+        )
+            .into_response();
+    }
+
     match sqlx::query_as::<_, AvatarRecord>(
         "SELECT username, mime_type, data, updated_at FROM avatars WHERE username = ?",
     )
@@ -4602,15 +5004,25 @@ async fn get_avatar(
     .fetch_optional(&state.db)
     .await
     {
-        Ok(Some(avatar)) => (
-            [
-                (axum::http::header::CONTENT_TYPE, avatar.mime_type.as_str()),
-                (axum::http::header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
-                (axum::http::header::PRAGMA, "no-cache"),
-            ],
-            avatar.data,
-        )
-            .into_response(),
+        Ok(Some(avatar)) => {
+            let _ = write_asset_file(
+                file_dir,
+                "avatar",
+                &avatar.mime_type,
+                &avatar.data,
+                Some(avatar.updated_at),
+            )
+            .await;
+            (
+                [
+                    (axum::http::header::CONTENT_TYPE, avatar.mime_type.as_str()),
+                    (axum::http::header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+                    (axum::http::header::PRAGMA, "no-cache"),
+                ],
+                avatar.data,
+            )
+                .into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             error!("Ошибка получения аватара {}: {}", username, e);
@@ -4664,6 +5076,19 @@ async fn upload_avatar(
     }
 
     let updated_at = Utc::now();
+    let write_result = write_asset_file(
+        user_avatar_asset_dir(&state.data_dir, &username),
+        "avatar",
+        &mime_type,
+        &file_data,
+        Some(updated_at),
+    )
+    .await;
+    if let Err(e) = write_result {
+        error!("Ошибка записи файла аватара {}: {}", username, e);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
     match sqlx::query(
         "INSERT INTO avatars (username, mime_type, data, updated_at)
          VALUES (?, ?, ?, ?)
@@ -4689,6 +5114,7 @@ async fn upload_avatar(
             .into_response()
         }
         Err(e) => {
+            let _ = clear_asset_file(user_avatar_asset_dir(&state.data_dir, &username), "avatar").await;
             error!("Ошибка сохранения аватара {}: {}", username, e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -4699,6 +5125,8 @@ async fn delete_avatar(
     AuthenticatedUser(username): AuthenticatedUser,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    let _ = clear_asset_file(user_avatar_asset_dir(&state.data_dir, &username), "avatar").await;
+
     match sqlx::query("DELETE FROM avatars WHERE username = ?")
         .bind(&username)
         .execute(&state.db)
@@ -5194,6 +5622,104 @@ async fn deliver_to_user(state: &Arc<AppState>, username: &str, msg: &Message) {
     }
 }
 
+fn role_permissions_for_view(action: &str, can_view: bool, can_send: bool, can_manage: bool) -> bool {
+    match action {
+        "view" => can_view,
+        "send" => can_send,
+        "manage" => can_manage,
+        _ => false,
+    }
+}
+
+fn fallback_role_permissions(role_id: &str) -> (bool, bool, bool) {
+    match role_id {
+        "owner" | "admin" => (true, true, true),
+        "member" => (true, true, false),
+        _ => (true, true, false),
+    }
+}
+
+async fn resolve_server_message_viewers(
+    state: &Arc<AppState>,
+    server: &ServerRecord,
+    channel_id: &str,
+    viewers: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    if viewers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let channel_permissions = load_channel_permissions(&state.db, channel_id).await?;
+    let channel_perm_map: HashMap<String, (bool, bool, bool)> = channel_permissions
+        .into_iter()
+        .map(|perm| (perm.role, (perm.canView, perm.canSend, perm.canManage)))
+        .collect();
+
+    let mut role_rows = sqlx::query(
+        "SELECT role_id, can_view, can_send, can_manage
+         FROM server_roles
+         WHERE server_id = ?",
+    )
+    .bind(&server.id)
+    .fetch_all(&state.db)
+    .await?;
+    let role_perm_map: HashMap<String, (bool, bool, bool)> = role_rows
+        .drain(..)
+        .map(|row| {
+            let role_id: String = row.get("role_id");
+            let can_view: i64 = row.get("can_view");
+            let can_send: i64 = row.get("can_send");
+            let can_manage: i64 = row.get("can_manage");
+            (role_id, (can_view != 0, can_send != 0, can_manage != 0))
+        })
+        .collect();
+
+    let mut member_roles = HashMap::new();
+    let mut builder = QueryBuilder::<Sqlite>::new(
+        "SELECT username, role FROM server_members WHERE server_id = ",
+    );
+    builder.push_bind(&server.id);
+    builder.push(" AND username IN (");
+    let mut separated = builder.separated(", ");
+    for viewer in viewers {
+        separated.push_bind(viewer);
+    }
+    separated.push_unseparated(")");
+    let rows = builder.build().fetch_all(&state.db).await?;
+    for row in rows {
+        let username: String = row.get("username");
+        let role: String = row.get("role");
+        member_roles.insert(username, role);
+    }
+
+    let mut allowed = Vec::with_capacity(viewers.len());
+    for viewer in viewers {
+        if viewer == &server.owner {
+            allowed.push(viewer.clone());
+            continue;
+        }
+
+        let Some(role_id) = member_roles.get(viewer) else {
+            if server.is_public != 0 {
+                allowed.push(viewer.clone());
+            }
+            continue;
+        };
+
+        let perms = channel_perm_map
+            .get(role_id)
+            .copied()
+            .or_else(|| role_perm_map.get(role_id).copied())
+            .unwrap_or_else(|| fallback_role_permissions(role_id));
+
+        if role_permissions_for_view("view", perms.0, perms.1, perms.2) {
+            allowed.push(viewer.clone());
+        }
+    }
+
+    Ok(allowed)
+}
+
 async fn deliver_server_message(state: &Arc<AppState>, msg: &Message) {
     let payload = match serde_json::to_string(msg) {
         Ok(json) => json,
@@ -5218,15 +5744,31 @@ async fn deliver_server_message(state: &Arc<AppState>, msg: &Message) {
         channel_id,
         viewers.len()
     );
-    for viewer in viewers {
-        if !can_access_channel_fast(&state.db, server_id, channel_id, &viewer, "view").await {
-            info!(
-                "WS deliver_server_message skip viewer={} message_id={} reason=channel_access_denied",
-                viewer,
-                msg.id
-            );
-            continue;
+
+    let server = match get_server_accessibility(&state.db, server_id).await {
+        Ok(Some(server)) => server,
+        Ok(None) => return,
+        Err(e) => {
+            error!("Ошибка проверки доступа к серверу {} перед доставкой сообщения {}: {}", server_id, msg.id, e);
+            return;
         }
+    };
+
+    let allowed_viewers = match resolve_server_message_viewers(state, &server, channel_id, &viewers).await {
+        Ok(list) => list,
+        Err(e) => {
+            error!(
+                "Ошибка предварительного расчёта зрителей для сообщения {} в {}/{}: {}",
+                msg.id,
+                server_id,
+                channel_id,
+                e
+            );
+            return;
+        }
+    };
+
+    for viewer in allowed_viewers {
         let sent = send_payload_to_user(state, &viewer, payload.clone(), "deliver_server_message").await;
         if sent > 0 {
             info!(
