@@ -830,7 +830,15 @@ async fn main() {
         .execute(&pool)
         .await
         .ok();
-    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_id ON messages (client_id)")
+    sqlx::query("DROP INDEX IF EXISTS idx_messages_client_id")
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_scope
+         ON messages (client_id, sender, receiver, COALESCE(server_id, ''), COALESCE(channel_id, ''))
+         WHERE client_id IS NOT NULL AND client_id <> ''",
+    )
         .execute(&pool)
         .await
         .ok();
@@ -1212,7 +1220,15 @@ async fn ensure_message_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             .execute(pool)
             .await?;
     }
-    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_id ON messages (client_id)")
+    sqlx::query("DROP INDEX IF EXISTS idx_messages_client_id")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_scope
+         ON messages (client_id, sender, receiver, COALESCE(server_id, ''), COALESCE(channel_id, ''))
+         WHERE client_id IS NOT NULL AND client_id <> ''",
+    )
         .execute(pool)
         .await
         .ok();
@@ -2158,19 +2174,47 @@ async fn verify_password(password: String, hash: String) -> Result<bool, String>
 async fn broadcast_json(state: &Arc<AppState>, payload: String) {
     let viewers: Vec<String> = state.user_connections.iter().map(|entry| entry.key().clone()).collect();
     for viewer in viewers {
-        if let Some(mut conns) = state.user_connections.get_mut(&viewer) {
-            conns.retain(|conn| !conn.is_closed());
-            let mut any_failed = false;
-            for conn in conns.iter() {
-                if conn.try_send(payload.clone()).is_err() {
-                    any_failed = true;
-                }
-            }
-            if any_failed {
-                conns.retain(|conn| !conn.is_closed());
-            }
+        send_payload_to_user(state, &viewer, payload.clone(), "broadcast_json").await;
+    }
+}
+
+async fn send_payload_to_user(
+    state: &Arc<AppState>,
+    username: &str,
+    payload: String,
+    label: &str,
+) -> usize {
+    let senders = if let Some(mut conns) = state.user_connections.get_mut(username) {
+        conns.retain(|conn| !conn.is_closed());
+        conns.iter().cloned().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    if senders.is_empty() {
+        return 0;
+    }
+
+    let mut sent = 0usize;
+    let mut failed = false;
+    for conn in senders {
+        match tokio::time::timeout(Duration::from_secs(2), conn.send(payload.clone())).await {
+            Ok(Ok(())) => sent += 1,
+            Ok(Err(_)) | Err(_) => failed = true,
         }
     }
+
+    if failed {
+        if let Some(mut conns) = state.user_connections.get_mut(username) {
+            conns.retain(|conn| !conn.is_closed());
+        }
+        warn!(
+            "WS send had closed/slow receivers label={} username={} sent={}",
+            label, username, sent
+        );
+    }
+
+    sent
 }
 
 async fn broadcast_avatar_event(
@@ -2205,40 +2249,8 @@ async fn send_json_to_user(state: &Arc<AppState>, username: &str, payload: serde
                 payload["inviter"].as_str().unwrap_or_default()
             );
         }
-        if event_type.starts_with("voice_") {
-            let senders: Vec<WsSender> = conns.iter().cloned().collect();
-            drop(conns);
-            let mut any_failed = false;
-            for conn in senders {
-                if tokio::time::timeout(Duration::from_millis(300), conn.send(json.clone()))
-                    .await
-                    .is_err()
-                {
-                    any_failed = true;
-                }
-            }
-            if any_failed {
-                if let Some(mut conns) = state.user_connections.get_mut(username) {
-                    conns.retain(|conn| !conn.is_closed());
-                    warn!(
-                        "[VOICE][SEND] to={} type={} timed_out_or_failed remaining_ws={}",
-                        username,
-                        event_type,
-                        conns.len()
-                    );
-                }
-            }
-        } else {
-            let mut any_failed = false;
-            for conn in conns.iter() {
-                if conn.try_send(json.clone()).is_err() {
-                    any_failed = true;
-                }
-            }
-            if any_failed {
-                conns.retain(|conn| !conn.is_closed());
-            }
-        }
+        drop(conns);
+        send_payload_to_user(state, username, json, "send_json_to_user").await;
     } else if event_type.starts_with("voice_") {
         warn!(
             "[VOICE][SEND] to={} type={} no_connection_entry roomId={} roomType={}",
@@ -2741,19 +2753,7 @@ async fn broadcast_reaction_event(
                     "reactions": reactions,
                     "myReaction": my_reaction
                 });
-                if let Some(mut conns) = state.user_connections.get_mut(&viewer) {
-                    conns.retain(|conn| !conn.is_closed());
-                    let json = payload.to_string();
-                    let mut any_failed = false;
-                    for conn in conns.iter() {
-                        if conn.try_send(json.clone()).is_err() {
-                            any_failed = true;
-                        }
-                    }
-                    if any_failed {
-                        conns.retain(|conn| !conn.is_closed());
-                    }
-                }
+                send_payload_to_user(state, &viewer, payload.to_string(), "reaction_updated").await;
             }
             Err(e) => {
                 error!("Ошибка загрузки реакций для {}: {}", message.id, e);
@@ -4393,9 +4393,22 @@ async fn get_server_messages(
                 auth_user,
                 msgs.len()
             );
-            let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+            let mut available_msgs = Vec::with_capacity(msgs.len());
+            for msg in msgs {
+                let path = state.uploads_dir.join(&msg.filename);
+                if fs::try_exists(&path).await.unwrap_or(false) {
+                    available_msgs.push(msg);
+                } else {
+                    warn!(
+                        "API get_server_messages skip orphan record id={} missing_file={}",
+                        msg.id,
+                        path.display()
+                    );
+                }
+            }
+            let ids: Vec<String> = available_msgs.iter().map(|m| m.id.clone()).collect();
             let reaction_states = load_reaction_states(&state, &ids, &auth_user).await.unwrap_or_default();
-            let response: Vec<MessageResponse> = msgs
+            let response: Vec<MessageResponse> = available_msgs
                 .into_iter()
                 .map(|msg| {
                     let (reactions, my_reaction) = reaction_states.get(&msg.id).cloned().unwrap_or_default();
@@ -4455,11 +4468,24 @@ async fn get_messages(
                 state.data_dir.join("zali_messenger.db").display(),
                 state.uploads_dir.display()
             );
-            let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+            let mut available_msgs = Vec::with_capacity(msgs.len());
+            for msg in msgs {
+                let path = state.uploads_dir.join(&msg.filename);
+                if fs::try_exists(&path).await.unwrap_or(false) {
+                    available_msgs.push(msg);
+                } else {
+                    warn!(
+                        "API get_messages skip orphan record id={} missing_file={}",
+                        msg.id,
+                        path.display()
+                    );
+                }
+            }
+            let ids: Vec<String> = available_msgs.iter().map(|m| m.id.clone()).collect();
             let reaction_states = load_reaction_states(&state, &ids, &effective_user)
                 .await
                 .unwrap_or_default();
-            let response: Vec<MessageResponse> = msgs
+            let response: Vec<MessageResponse> = available_msgs
                 .into_iter()
                 .map(|msg| {
                     let (reactions, my_reaction) = reaction_states.get(&msg.id).cloned().unwrap_or_default();
@@ -4689,6 +4715,37 @@ async fn delete_avatar(
     }
 }
 
+async fn find_message_by_client_scope(
+    state: &Arc<AppState>,
+    client_id: &str,
+    sender: &str,
+    receiver: &str,
+    server_id: Option<&str>,
+    channel_id: Option<&str>,
+) -> Result<Option<Message>, sqlx::Error> {
+    if client_id.trim().is_empty() {
+        return Ok(None);
+    }
+
+    sqlx::query_as::<_, Message>(
+        "SELECT id, client_id, sender, receiver, filename, timestamp, server_id, channel_id
+         FROM messages
+         WHERE client_id = ?
+           AND sender = ?
+           AND receiver = ?
+           AND COALESCE(server_id, '') = ?
+           AND COALESCE(channel_id, '') = ?
+         LIMIT 1",
+    )
+    .bind(client_id)
+    .bind(sender)
+    .bind(receiver)
+    .bind(server_id.unwrap_or(""))
+    .bind(channel_id.unwrap_or(""))
+    .fetch_optional(&state.db)
+    .await
+}
+
 async fn upload_message(
     AuthenticatedUser(auth_user): AuthenticatedUser,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -4894,36 +4951,66 @@ async fn upload_message_with_context(
         !server_id_opt.is_none() || !channel_id_opt.is_none()
     );
 
-    let insert_result = if client_id.is_empty() {
-        sqlx::query(
-            "INSERT INTO messages (id, client_id, sender, receiver, filename, timestamp, server_id, channel_id) VALUES (?, NULL, ?, ?, ?, ?, ?, ?)",
+    if !client_id.is_empty() {
+        match find_message_by_client_scope(
+            &state,
+            &client_id,
+            &sender,
+            &receiver,
+            server_id_opt.as_deref(),
+            channel_id_opt.as_deref(),
         )
-        .bind(&id)
-        .bind(&sender)
-        .bind(&receiver)
-        .bind(&filename)
-        .bind(timestamp)
-        .bind(&server_id_opt)
-        .bind(&channel_id_opt)
-        .execute(&state.db)
         .await
-    } else {
-        sqlx::query(
-            "INSERT INTO messages (id, client_id, sender, receiver, filename, timestamp, server_id, channel_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(client_id) DO NOTHING",
-        )
-        .bind(&id)
-        .bind(&client_id)
-        .bind(&sender)
-        .bind(&receiver)
-        .bind(&filename)
-        .bind(timestamp)
-        .bind(&server_id_opt)
-        .bind(&channel_id_opt)
-        .execute(&state.db)
-        .await
-    };
+        {
+            Ok(Some(existing)) => {
+                info!(
+                    "UPLOAD deduplicated by scoped client_id={} existing_message_id={}",
+                    client_id, existing.id
+                );
+                return (
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({ "id": existing.id, "clientId": client_id })),
+                )
+                    .into_response();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                error!("Ошибка проверки client_id={} перед вставкой: {}", client_id, e);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
+
+    if let Err(e) = fs::write(&temp_path, &file_data).await {
+        error!("Ошибка записи временного файла {}: {}", temp_path.display(), e);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(e) = fs::rename(&temp_path, &path).await {
+        error!(
+            "Ошибка атомарного перемещения файла {} -> {}: {}",
+            temp_path.display(),
+            path.display(),
+            e
+        );
+        let _ = fs::remove_file(&temp_path).await;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let insert_result = sqlx::query(
+        "INSERT INTO messages (id, client_id, sender, receiver, filename, timestamp, server_id, channel_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(if client_id.is_empty() { None::<&str> } else { Some(client_id.as_str()) })
+    .bind(&sender)
+    .bind(&receiver)
+    .bind(&filename)
+    .bind(timestamp)
+    .bind(&server_id_opt)
+    .bind(&channel_id_opt)
+    .execute(&state.db)
+    .await;
 
     match insert_result {
         Ok(result) => {
@@ -4933,51 +5020,6 @@ async fn upload_message_with_context(
                 client_id,
                 result.rows_affected()
             );
-            let is_new_message = client_id.is_empty() || result.rows_affected() > 0;
-            let message_id = if !client_id.is_empty() && result.rows_affected() == 0 {
-                match sqlx::query_scalar::<_, String>("SELECT id FROM messages WHERE client_id = ? LIMIT 1")
-                    .bind(&client_id)
-                    .fetch_optional(&state.db)
-                    .await
-                {
-                    Ok(Some(existing_id)) => existing_id,
-                    _ => id.clone(),
-                }
-            } else {
-                id.clone()
-            };
-            if !is_new_message {
-                info!(
-                    "UPLOAD deduplicated by client_id={} existing_message_id={}",
-                    client_id,
-                    message_id
-                );
-                return (StatusCode::CREATED, Json(serde_json::json!({ "id": message_id, "clientId": client_id }))).into_response();
-            }
-
-            if let Err(e) = fs::write(&temp_path, &file_data).await {
-                error!("Ошибка записи временного файла {}: {}", temp_path.display(), e);
-                let _ = sqlx::query("DELETE FROM messages WHERE id = ?")
-                    .bind(&message_id)
-                    .execute(&state.db)
-                    .await;
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-
-            if let Err(e) = fs::rename(&temp_path, &path).await {
-                error!(
-                    "Ошибка атомарного перемещения файла {} -> {}: {}",
-                    temp_path.display(),
-                    path.display(),
-                    e
-                );
-                let _ = fs::remove_file(&temp_path).await;
-                let _ = sqlx::query("DELETE FROM messages WHERE id = ?")
-                    .bind(&message_id)
-                    .execute(&state.db)
-                    .await;
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
 
             info!(
                 "Новое сообщение: {} → {} ({}){}",
@@ -4992,7 +5034,7 @@ async fn upload_message_with_context(
             );
 
             let msg = Message {
-                id: message_id.clone(),
+                id: id.clone(),
                 client_id: if client_id.is_empty() { None } else { Some(client_id.clone()) },
                 sender: sender.clone(),
                 receiver: receiver.clone(),
@@ -5006,10 +5048,8 @@ async fn upload_message_with_context(
                 info!("UPLOAD delivering server message id={}", msg.id);
                 deliver_server_message(&state, &msg).await;
             } else {
-                // Deliver to receiver's active WS connections
                 info!("UPLOAD delivering dm id={} to receiver={} sender={}", msg.id, receiver, sender);
                 deliver_to_user(&state, &receiver, &msg).await;
-                // Deliver to sender's own connections (for multi-device sync)
                 if sender != receiver {
                     info!("UPLOAD delivering dm echo id={} to sender={}", msg.id, sender);
                     deliver_to_user(&state, &sender, &msg).await;
@@ -5020,15 +5060,38 @@ async fn upload_message_with_context(
                 "UPLOAD complete id={} client_id={} message_id={} sender={} receiver={} server={:?} channel={:?}",
                 id,
                 client_id,
-                message_id,
+                msg.id,
                 sender,
                 receiver,
                 msg.server_id,
                 msg.channel_id
             );
-            (StatusCode::CREATED, Json(serde_json::json!({ "id": message_id, "clientId": msg.client_id }))).into_response()
+            (StatusCode::CREATED, Json(serde_json::json!({ "id": msg.id, "clientId": msg.client_id }))).into_response()
         }
         Err(e) => {
+            let _ = fs::remove_file(&path).await;
+            if !client_id.is_empty() {
+                if let Ok(Some(existing)) = find_message_by_client_scope(
+                    &state,
+                    &client_id,
+                    &sender,
+                    &receiver,
+                    server_id_opt.as_deref(),
+                    channel_id_opt.as_deref(),
+                )
+                .await
+                {
+                    info!(
+                        "UPLOAD deduplicated after insert race client_id={} existing_message_id={}",
+                        client_id, existing.id
+                    );
+                    return (
+                        StatusCode::CREATED,
+                        Json(serde_json::json!({ "id": existing.id, "clientId": client_id })),
+                    )
+                        .into_response();
+                }
+            }
             error!("Ошибка сохранения сообщения в БД: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -5107,29 +5170,20 @@ async fn deliver_to_user(state: &Arc<AppState>, username: &str, msg: &Message) {
         msg.id,
         active
     );
-    if let Some(mut conns) = state.user_connections.get_mut(username) {
-        conns.retain(|conn| !conn.is_closed());
-        let payload = match serde_json::to_string(msg) {
-            Ok(json) => json,
-            Err(e) => {
-                error!("Ошибка сериализации сообщения {}: {}", msg.id, e);
-                return;
-            }
-        };
-        let mut any_failed = false;
-        for conn in conns.iter() {
-            if conn.try_send(payload.clone()).is_err() {
-                any_failed = true;
-            }
+    let payload = match serde_json::to_string(msg) {
+        Ok(json) => json,
+        Err(e) => {
+            error!("Ошибка сериализации сообщения {}: {}", msg.id, e);
+            return;
         }
-        if any_failed {
-            conns.retain(|conn| !conn.is_closed());
-        }
+    };
+    let sent = send_payload_to_user(state, username, payload, "deliver_to_user").await;
+    if sent > 0 {
         info!(
             "WS deliver_to_user done username={} message_id={} sent_conns={}",
             username,
             msg.id,
-            conns.len()
+            sent
         );
     } else {
         info!(
@@ -5173,22 +5227,13 @@ async fn deliver_server_message(state: &Arc<AppState>, msg: &Message) {
             );
             continue;
         }
-        if let Some(mut conns) = state.user_connections.get_mut(&viewer) {
-            conns.retain(|conn| !conn.is_closed());
-            let mut any_failed = false;
-            for conn in conns.iter() {
-                if conn.try_send(payload.clone()).is_err() {
-                    any_failed = true;
-                }
-            }
-            if any_failed {
-                conns.retain(|conn| !conn.is_closed());
-            }
+        let sent = send_payload_to_user(state, &viewer, payload.clone(), "deliver_server_message").await;
+        if sent > 0 {
             info!(
                 "WS deliver_server_message sent viewer={} message_id={} conns={}",
                 viewer,
                 msg.id,
-                conns.len()
+                sent
             );
         }
     }
@@ -5378,7 +5423,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, username: St
         .user_connections
         .entry(username.clone())
         .or_default()
-        .push(tx);
+        .push(tx.clone());
 
     info!(
         "[WS] '{}' подключился (voice_rooms={}, active_ws={})",
@@ -5451,7 +5496,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, username: St
 
     // Clean up closed senders
     if let Some(mut conns) = state.user_connections.get_mut(&username) {
-        conns.retain(|c| !c.is_closed());
+        conns.retain(|c| !c.same_channel(&tx) && !c.is_closed());
     }
     state.user_connections.retain(|_, conns| !conns.is_empty());
 
