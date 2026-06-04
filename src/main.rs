@@ -5,16 +5,18 @@ use axum::{
     },
     http::{header, HeaderValue, Method, StatusCode},
     response::IntoResponse,
-        routing::{get, patch, post, put},
+    routing::{get, patch, post, put},
     Json, Router,
 };
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use base64::Engine;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous},
+    sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+    },
     QueryBuilder, Row, Sqlite,
 };
 use std::{
@@ -26,9 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{fs, sync::mpsc, task};
-use tower_http::{
-    cors::{AllowOrigin, CorsLayer},
-};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 
@@ -160,10 +160,16 @@ fn server_asset_dir(data_dir: &Path, server_id: &str) -> PathBuf {
 }
 
 fn asset_file_paths(base_dir: PathBuf, kind: &str) -> (PathBuf, PathBuf) {
-    (base_dir.join(format!("{}.bin", kind)), base_dir.join(format!("{}.json", kind)))
+    (
+        base_dir.join(format!("{}.bin", kind)),
+        base_dir.join(format!("{}.json", kind)),
+    )
 }
 
-async fn read_asset_file(base_dir: PathBuf, kind: &str) -> Result<Option<(String, Vec<u8>, Option<DateTime<Utc>>)>, std::io::Error> {
+async fn read_asset_file(
+    base_dir: PathBuf,
+    kind: &str,
+) -> Result<Option<(String, Vec<u8>, Option<DateTime<Utc>>)>, std::io::Error> {
     let (bin_path, meta_path) = asset_file_paths(base_dir, kind);
     if !fs::try_exists(&bin_path).await.unwrap_or(false) {
         return Ok(None);
@@ -345,11 +351,13 @@ async fn migrate_legacy_storage(
         .unwrap_or(0);
     info!(
         "После миграции: messages={}, contacts={}",
-        migrated_messages,
-        migrated_contacts
+        migrated_messages, migrated_contacts
     );
 
-    if let Err(e) = sqlx::query("DETACH DATABASE legacy").execute(&mut *conn).await {
+    if let Err(e) = sqlx::query("DETACH DATABASE legacy")
+        .execute(&mut *conn)
+        .await
+    {
         warn!("Не удалось отсоединить legacy БД после миграции: {}", e);
     }
 
@@ -367,8 +375,12 @@ async fn migrate_legacy_storage(
 
 async fn migrate_asset_files(pool: &SqlitePool, data_dir: &Path) -> Result<(), sqlx::Error> {
     let assets_dir = asset_root_dir(data_dir);
-    fs::create_dir_all(assets_dir.join("avatars")).await.map_err(sqlx::Error::Io)?;
-    fs::create_dir_all(assets_dir.join("servers")).await.map_err(sqlx::Error::Io)?;
+    fs::create_dir_all(assets_dir.join("avatars"))
+        .await
+        .map_err(sqlx::Error::Io)?;
+    fs::create_dir_all(assets_dir.join("servers"))
+        .await
+        .map_err(sqlx::Error::Io)?;
 
     let avatars: Vec<AvatarRecord> = sqlx::query_as(
         "SELECT username, mime_type, data, updated_at FROM avatars WHERE data IS NOT NULL AND length(data) > 0",
@@ -393,7 +405,13 @@ async fn migrate_asset_files(pool: &SqlitePool, data_dir: &Path) -> Result<(), s
         .map_err(sqlx::Error::Io)?;
     }
 
-    let servers: Vec<(String, Option<String>, Option<Vec<u8>>, Option<String>, Option<Vec<u8>>)> = sqlx::query_as(
+    let servers: Vec<(
+        String,
+        Option<String>,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<Vec<u8>>,
+    )> = sqlx::query_as(
         "SELECT id, avatar_mime, avatar_data, banner_mime, banner_data FROM servers",
     )
     .fetch_all(pool)
@@ -401,7 +419,10 @@ async fn migrate_asset_files(pool: &SqlitePool, data_dir: &Path) -> Result<(), s
     for (server_id, avatar_mime, avatar_data, banner_mime, banner_data) in servers {
         if let (Some(mime), Some(data)) = (avatar_mime.as_ref(), avatar_data.as_ref()) {
             let dir = server_asset_dir(data_dir, &server_id);
-            if fs::try_exists(&asset_file_paths(dir.clone(), "avatar").0).await.unwrap_or(false) {
+            if fs::try_exists(&asset_file_paths(dir.clone(), "avatar").0)
+                .await
+                .unwrap_or(false)
+            {
                 // already migrated
             } else {
                 write_asset_file(dir.clone(), "avatar", mime, data, None)
@@ -411,7 +432,10 @@ async fn migrate_asset_files(pool: &SqlitePool, data_dir: &Path) -> Result<(), s
         }
         if let (Some(mime), Some(data)) = (banner_mime.as_ref(), banner_data.as_ref()) {
             let dir = server_asset_dir(data_dir, &server_id);
-            if fs::try_exists(&asset_file_paths(dir.clone(), "banner").0).await.unwrap_or(false) {
+            if fs::try_exists(&asset_file_paths(dir.clone(), "banner").0)
+                .await
+                .unwrap_or(false)
+            {
                 // already migrated
             } else {
                 write_asset_file(dir, "banner", mime, data, None)
@@ -498,7 +522,8 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for AuthenticatedUser {
         if let Some(query) = parts.uri.query() {
             for pair in query.split('&') {
                 if let Some((key, value)) = pair.split_once('=') {
-                    if matches!(key, "token" | "auth" | "access_token") && !value.trim().is_empty() {
+                    if matches!(key, "token" | "auth" | "access_token") && !value.trim().is_empty()
+                    {
                         if let Ok(token_data) = decode::<Claims>(
                             value,
                             &DecodingKey::from_secret(&state.config.jwt_secret),
@@ -692,7 +717,7 @@ struct ChannelRecord {
     created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ChannelResponse {
     id: String,
     name: String,
@@ -924,8 +949,9 @@ async fn main() {
     // Structured logging
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("zali_server=info,tower_http=warn")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("zali_server=info,tower_http=warn")
+            }),
         )
         .init();
 
@@ -942,15 +968,13 @@ async fn main() {
     info!("Каноническая БД: {}", db_path.display());
     info!("Каноническая uploads: {}", uploads_dir.display());
 
-    let sqlite_options = SqliteConnectOptions::from_str(&format!(
-        "sqlite:{}?mode=rwc",
-        db_path.to_string_lossy()
-    ))
-        .expect("Ошибка разбора строки подключения к базе данных")
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_secs(5));
+    let sqlite_options =
+        SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", db_path.to_string_lossy()))
+            .expect("Ошибка разбора строки подключения к базе данных")
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5));
 
     let pool = SqlitePoolOptions::new()
         .min_connections(1)
@@ -1161,7 +1185,10 @@ async fn main() {
         ("can_ban", "INTEGER NOT NULL DEFAULT 0"),
     ];
     for (column, definition) in extra_server_role_columns {
-        let query = format!("ALTER TABLE server_roles ADD COLUMN {} {}", column, definition);
+        let query = format!(
+            "ALTER TABLE server_roles ADD COLUMN {} {}",
+            column, definition
+        );
         sqlx::query(&query).execute(&pool).await.ok();
     }
 
@@ -1212,20 +1239,26 @@ async fn main() {
         .ok();
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts (owner)")
         .execute(&pool)
+        .await
+        .ok();
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_server_members_server_id ON server_members (server_id)",
+    )
+    .execute(&pool)
     .await
     .ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_server_members_server_id ON server_members (server_id)")
-        .execute(&pool)
-        .await
-        .ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_server_members_username ON server_members (username)")
-        .execute(&pool)
-        .await
-        .ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_server_roles_server_id ON server_roles (server_id)")
-        .execute(&pool)
-        .await
-        .ok();
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_server_members_username ON server_members (username)",
+    )
+    .execute(&pool)
+    .await
+    .ok();
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_server_roles_server_id ON server_roles (server_id)",
+    )
+    .execute(&pool)
+    .await
+    .ok();
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_channels_server_id ON channels (server_id)")
         .execute(&pool)
         .await
@@ -1234,10 +1267,12 @@ async fn main() {
         .execute(&pool)
         .await
         .ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_server_invites_server_id ON server_invites (server_id)")
-        .execute(&pool)
-        .await
-        .ok();
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_server_invites_server_id ON server_invites (server_id)",
+    )
+    .execute(&pool)
+    .await
+    .ok();
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_reactions_message_id ON reactions (message_id)")
         .execute(&pool)
         .await
@@ -1313,18 +1348,34 @@ async fn main() {
         .route("/api/avatar/:username", get(get_avatar))
         .route("/api/avatar", post(upload_avatar).delete(delete_avatar))
         .route("/api/contacts", get(get_contacts).post(add_contact))
-        .route("/api/contacts/:username", axum::routing::delete(delete_contact))
+        .route(
+            "/api/contacts/:username",
+            axum::routing::delete(delete_contact),
+        )
         .route("/api/servers", get(get_servers).post(create_server))
         .route("/api/discover/servers", get(get_public_servers))
         .route("/api/servers/join", post(join_server_link))
-        .route("/api/servers/:server_id/channels", get(get_channels).post(create_channel))
+        .route(
+            "/api/servers/:server_id/channels",
+            get(get_channels).post(create_channel),
+        )
         .route(
             "/api/servers/:server_id/channels/:channel_id",
             patch(update_channel).delete(delete_channel),
         )
         .route("/api/servers/:server_id", put(update_server))
-        .route("/api/servers/:server_id/assets/avatar", get(get_server_avatar).put(set_server_avatar).delete(delete_server_avatar))
-        .route("/api/servers/:server_id/assets/banner", get(get_server_banner).put(set_server_banner).delete(delete_server_banner))
+        .route(
+            "/api/servers/:server_id/assets/avatar",
+            get(get_server_avatar)
+                .put(set_server_avatar)
+                .delete(delete_server_avatar),
+        )
+        .route(
+            "/api/servers/:server_id/assets/banner",
+            get(get_server_banner)
+                .put(set_server_banner)
+                .delete(delete_server_banner),
+        )
         .route(
             "/api/servers/:server_id/members",
             get(get_server_members).post(add_server_member),
@@ -1333,13 +1384,31 @@ async fn main() {
             "/api/servers/:server_id/members/:username",
             patch(update_server_member).delete(delete_server_member),
         )
-        .route("/api/servers/:server_id/roles", get(get_server_roles).post(create_server_role))
-        .route("/api/servers/:server_id/roles/:role_id", patch(update_server_role).delete(delete_server_role))
-        .route("/api/servers/:server_id/invites", get(get_server_invites).post(create_server_invite))
+        .route(
+            "/api/servers/:server_id/roles",
+            get(get_server_roles).post(create_server_role),
+        )
+        .route(
+            "/api/servers/:server_id/roles/:role_id",
+            patch(update_server_role).delete(delete_server_role),
+        )
+        .route(
+            "/api/servers/:server_id/invites",
+            get(get_server_invites).post(create_server_invite),
+        )
         .route("/api/invites/:code/join", post(join_server_invite))
-        .route("/api/servers/:server_id/channels/:channel_id/permissions", get(get_channel_permissions).put(update_channel_permissions))
-        .route("/api/servers/:server_id", axum::routing::delete(delete_server))
-        .route("/api/servers/:server_id/channels/:channel_id/messages", get(get_server_messages).post(upload_server_message))
+        .route(
+            "/api/servers/:server_id/channels/:channel_id/permissions",
+            get(get_channel_permissions).put(update_channel_permissions),
+        )
+        .route(
+            "/api/servers/:server_id",
+            axum::routing::delete(delete_server),
+        )
+        .route(
+            "/api/servers/:server_id/channels/:channel_id/messages",
+            get(get_server_messages).post(upload_server_message),
+        )
         .route("/api/messages/:user", get(get_messages))
         .route("/api/message/:id/reaction", post(set_message_reaction))
         .route("/api/upload", post(upload_message))
@@ -1395,7 +1464,9 @@ async fn health_check() -> impl IntoResponse {
 }
 
 async fn column_exists(pool: &SqlitePool, column: &str) -> Result<bool, sqlx::Error> {
-    let rows = sqlx::query("PRAGMA table_info(messages)").fetch_all(pool).await?;
+    let rows = sqlx::query("PRAGMA table_info(messages)")
+        .fetch_all(pool)
+        .await?;
     Ok(rows.iter().any(|row| {
         let name: String = row.get("name");
         name == column
@@ -1484,7 +1555,13 @@ async fn seed_default_servers(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         let channel_specs = match *id {
             "zali-hub" => vec![
                 ("general", "general", "Общий чат", "text", 0),
-                ("announcements", "announcements", "Новости и объявления", "text", 1),
+                (
+                    "announcements",
+                    "announcements",
+                    "Новости и объявления",
+                    "text",
+                    1,
+                ),
                 ("media", "media", "Фото и видео", "text", 2),
                 ("voice", "voice", "Голосовой холл", "voice", 3),
             ],
@@ -1548,11 +1625,69 @@ async fn ensure_default_server_roles(
     created_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     let default_roles = [
-        ("member", "Участник", "#5f6a7a", 1_i64, 1_i64, 0_i64, 0_i64, 0_i64, 0_i64, 1_i64, 1_i64, 1_i64, 0_i64, 0_i64, 1_i64, 0_i64, 0_i64),
-        ("admin", "Админ", "#8c7bff", 1_i64, 1_i64, 1_i64, 1_i64, 1_i64, 1_i64, 1_i64, 1_i64, 1_i64, 1_i64, 1_i64, 1_i64, 1_i64, 1_i64),
+        (
+            "member",
+            "Участник",
+            "#5f6a7a",
+            1_i64,
+            1_i64,
+            0_i64,
+            0_i64,
+            0_i64,
+            0_i64,
+            1_i64,
+            1_i64,
+            1_i64,
+            0_i64,
+            0_i64,
+            1_i64,
+            0_i64,
+            0_i64,
+        ),
+        (
+            "admin",
+            "Админ",
+            "#8c7bff",
+            1_i64,
+            1_i64,
+            1_i64,
+            1_i64,
+            1_i64,
+            1_i64,
+            1_i64,
+            1_i64,
+            1_i64,
+            1_i64,
+            1_i64,
+            1_i64,
+            1_i64,
+            1_i64,
+        ),
     ];
 
-    for (position, (role_id, name, color, can_view, can_send, can_manage, can_manage_channels, can_manage_roles, can_invite, can_attach, can_embed, can_react, can_pin, can_mention, can_voice, can_kick, can_ban)) in default_roles.iter().enumerate() {
+    for (
+        position,
+        (
+            role_id,
+            name,
+            color,
+            can_view,
+            can_send,
+            can_manage,
+            can_manage_channels,
+            can_manage_roles,
+            can_invite,
+            can_attach,
+            can_embed,
+            can_react,
+            can_pin,
+            can_mention,
+            can_voice,
+            can_kick,
+            can_ban,
+        ),
+    ) in default_roles.iter().enumerate()
+    {
         sqlx::query(
             "INSERT OR IGNORE INTO server_roles (server_id, role_id, name, color, can_view, can_send, can_manage, can_manage_channels, can_manage_roles, can_invite, can_attach, can_embed, can_react, can_pin, can_mention, can_voice, can_kick, can_ban, position, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1584,7 +1719,10 @@ async fn ensure_default_server_roles(
     Ok(())
 }
 
-async fn get_server_accessibility(pool: &SqlitePool, server_id: &str) -> Result<Option<ServerRecord>, sqlx::Error> {
+async fn get_server_accessibility(
+    pool: &SqlitePool,
+    server_id: &str,
+) -> Result<Option<ServerRecord>, sqlx::Error> {
     sqlx::query_as::<_, ServerRecord>(
         "SELECT id, name, description, icon, color, join_link, owner, is_public, created_at FROM servers WHERE id = ? LIMIT 1",
     )
@@ -1593,7 +1731,10 @@ async fn get_server_accessibility(pool: &SqlitePool, server_id: &str) -> Result<
     .await
 }
 
-async fn load_channels_for_server(pool: &SqlitePool, server_id: &str) -> Result<Vec<ChannelResponse>, sqlx::Error> {
+async fn load_channels_for_server(
+    pool: &SqlitePool,
+    server_id: &str,
+) -> Result<Vec<ChannelResponse>, sqlx::Error> {
     let rows = sqlx::query_as::<_, ChannelRecord>(
         "SELECT id, server_id, name, topic, kind, position, created_at FROM channels WHERE server_id = ? ORDER BY position ASC, name ASC",
     )
@@ -1672,7 +1813,8 @@ async fn load_server_role_permissions_map(
         );
     }
     map.entry("admin".to_string()).or_insert((true, true, true));
-    map.entry("member".to_string()).or_insert((true, true, false));
+    map.entry("member".to_string())
+        .or_insert((true, true, false));
     map.entry("owner".to_string()).or_insert((true, true, true));
     Ok(map)
 }
@@ -1693,9 +1835,10 @@ async fn load_channel_permissions_map(
     .await?;
     let mut map: HashMap<String, HashMap<String, (bool, bool, bool)>> = HashMap::new();
     for row in rows {
-        map.entry(row.channel_id)
-            .or_default()
-            .insert(row.role, (row.can_view != 0, row.can_send != 0, row.can_manage != 0));
+        map.entry(row.channel_id).or_default().insert(
+            row.role,
+            (row.can_view != 0, row.can_send != 0, row.can_manage != 0),
+        );
     }
     Ok(map)
 }
@@ -1767,7 +1910,10 @@ async fn build_server_response(
     server: ServerRecord,
     viewer: &str,
 ) -> Result<ServerResponse, sqlx::Error> {
-    let channels = if can_manage_server(pool, &server.id, viewer).await.unwrap_or(false) {
+    let channels = if can_manage_server(pool, &server.id, viewer)
+        .await
+        .unwrap_or(false)
+    {
         load_channels_for_server(pool, &server.id).await?
     } else {
         load_visible_channels_for_server(pool, &server.id, viewer).await?
@@ -1787,6 +1933,214 @@ async fn build_server_response(
         member_count,
         channels,
     })
+}
+
+async fn build_server_responses_batch(
+    pool: &SqlitePool,
+    records: Vec<ServerRecord>,
+    viewer: &str,
+) -> Result<Vec<ServerResponse>, sqlx::Error> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let server_ids: Vec<String> = records.iter().map(|server| server.id.clone()).collect();
+
+    let mut member_counts: HashMap<String, i64> = HashMap::new();
+    let mut count_builder = QueryBuilder::<Sqlite>::new(
+        "SELECT server_id, COUNT(*) AS count FROM server_members WHERE server_id IN (",
+    );
+    {
+        let mut separated = count_builder.separated(", ");
+        for id in &server_ids {
+            separated.push_bind(id);
+        }
+    }
+    count_builder.push(") GROUP BY server_id");
+    for row in count_builder.build().fetch_all(pool).await? {
+        let server_id: String = row.get("server_id");
+        let count: i64 = row.get("count");
+        member_counts.insert(server_id, count);
+    }
+
+    let mut viewer_roles: HashMap<String, String> = records
+        .iter()
+        .filter(|server| server.owner == viewer)
+        .map(|server| (server.id.clone(), "owner".to_string()))
+        .collect();
+    let mut role_builder =
+        QueryBuilder::<Sqlite>::new("SELECT server_id, role FROM server_members WHERE username = ");
+    role_builder.push_bind(viewer);
+    role_builder.push(" AND server_id IN (");
+    {
+        let mut separated = role_builder.separated(", ");
+        for id in &server_ids {
+            separated.push_bind(id);
+        }
+    }
+    role_builder.push(")");
+    for row in role_builder.build().fetch_all(pool).await? {
+        let server_id: String = row.get("server_id");
+        let role: String = row.get("role");
+        viewer_roles.entry(server_id).or_insert(role);
+    }
+
+    let mut channels_by_server: HashMap<String, Vec<ChannelResponse>> = HashMap::new();
+    let mut channel_builder = QueryBuilder::<Sqlite>::new(
+        "SELECT id, server_id, name, topic, kind, position, created_at FROM channels WHERE server_id IN (",
+    );
+    {
+        let mut separated = channel_builder.separated(", ");
+        for id in &server_ids {
+            separated.push_bind(id);
+        }
+    }
+    channel_builder.push(") ORDER BY server_id ASC, position ASC, name ASC");
+    for channel in channel_builder
+        .build_query_as::<ChannelRecord>()
+        .fetch_all(pool)
+        .await?
+    {
+        channels_by_server
+            .entry(channel.server_id)
+            .or_default()
+            .push(ChannelResponse {
+                id: channel.id,
+                name: channel.name,
+                topic: channel.topic,
+                kind: channel.kind,
+                position: channel.position,
+            });
+    }
+
+    let mut server_permissions: HashMap<String, HashMap<String, (bool, bool, bool)>> =
+        HashMap::new();
+    let mut server_perm_builder = QueryBuilder::<Sqlite>::new(
+        "SELECT server_id, role_id, can_view, can_send, can_manage FROM server_roles WHERE server_id IN (",
+    );
+    {
+        let mut separated = server_perm_builder.separated(", ");
+        for id in &server_ids {
+            separated.push_bind(id);
+        }
+    }
+    server_perm_builder.push(")");
+    for row in server_perm_builder.build().fetch_all(pool).await? {
+        let server_id: String = row.get("server_id");
+        let role_id: String = row.get("role_id");
+        let can_view: i64 = row.get("can_view");
+        let can_send: i64 = row.get("can_send");
+        let can_manage: i64 = row.get("can_manage");
+        server_permissions
+            .entry(server_id)
+            .or_default()
+            .insert(role_id, (can_view != 0, can_send != 0, can_manage != 0));
+    }
+    for id in &server_ids {
+        let perms = server_permissions.entry(id.clone()).or_default();
+        perms
+            .entry("admin".to_string())
+            .or_insert((true, true, true));
+        perms
+            .entry("member".to_string())
+            .or_insert((true, true, false));
+        perms
+            .entry("owner".to_string())
+            .or_insert((true, true, true));
+    }
+
+    let mut channel_permissions: HashMap<
+        String,
+        HashMap<String, HashMap<String, (bool, bool, bool)>>,
+    > = HashMap::new();
+    let mut channel_perm_builder = QueryBuilder::<Sqlite>::new(
+        "SELECT c.server_id, cp.channel_id, cp.role, cp.can_view, cp.can_send, cp.can_manage
+         FROM channel_permissions cp
+         INNER JOIN channels c ON c.id = cp.channel_id
+         WHERE c.server_id IN (",
+    );
+    {
+        let mut separated = channel_perm_builder.separated(", ");
+        for id in &server_ids {
+            separated.push_bind(id);
+        }
+    }
+    channel_perm_builder.push(")");
+    for row in channel_perm_builder.build().fetch_all(pool).await? {
+        let server_id: String = row.get("server_id");
+        let channel_id: String = row.get("channel_id");
+        let role: String = row.get("role");
+        let can_view: i64 = row.get("can_view");
+        let can_send: i64 = row.get("can_send");
+        let can_manage: i64 = row.get("can_manage");
+        channel_permissions
+            .entry(server_id)
+            .or_default()
+            .entry(channel_id)
+            .or_default()
+            .insert(role, (can_view != 0, can_send != 0, can_manage != 0));
+    }
+
+    let mut responses = Vec::with_capacity(records.len());
+    for server in records {
+        let server_id = server.id.clone();
+        let my_role = viewer_roles.get(&server_id).cloned();
+        let can_manage = can_manage_by_role(my_role.as_deref())
+            || my_role
+                .as_deref()
+                .and_then(|role| {
+                    server_permissions
+                        .get(&server_id)
+                        .and_then(|perms| perms.get(role))
+                })
+                .map(|perms| perms.2)
+                .unwrap_or(false);
+        let all_channels = channels_by_server.remove(&server_id).unwrap_or_default();
+        let channels =
+            if can_manage || server.owner == viewer || (my_role.is_none() && server.is_public != 0)
+            {
+                all_channels
+            } else if let Some(role) = my_role.as_deref() {
+                let empty_channel_permissions = HashMap::new();
+                let empty_server_permissions = HashMap::new();
+                let channel_perm_map = channel_permissions
+                    .get(&server_id)
+                    .unwrap_or(&empty_channel_permissions);
+                let server_perm_map = server_permissions
+                    .get(&server_id)
+                    .unwrap_or(&empty_server_permissions);
+                all_channels
+                    .into_iter()
+                    .filter(|channel| {
+                        channel_allows_action(
+                            channel_perm_map,
+                            server_perm_map,
+                            role,
+                            &channel.id,
+                            "view",
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        responses.push(ServerResponse {
+            id: server_id.clone(),
+            name: server.name,
+            description: server.description,
+            icon: server.icon,
+            color: server.color,
+            join_link: server.join_link,
+            owner: server.owner,
+            is_public: server.is_public != 0,
+            my_role,
+            member_count: member_counts.get(&server_id).copied().unwrap_or(0),
+            channels,
+        });
+    }
+
+    Ok(responses)
 }
 
 fn normalize_server_role(role: Option<&str>) -> Option<String> {
@@ -1832,7 +2186,11 @@ fn normalize_data_url(value: &str) -> Result<(String, Vec<u8>), &'static str> {
     let meta = &value[5..comma];
     let payload = &value[comma + 1..];
     let parts: Vec<&str> = meta.split(';').collect();
-    let mime = parts.first().copied().unwrap_or("application/octet-stream").to_string();
+    let mime = parts
+        .first()
+        .copied()
+        .unwrap_or("application/octet-stream")
+        .to_string();
     if parts.iter().any(|p| *p == "base64") {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(payload)
@@ -1861,14 +2219,18 @@ async fn get_server_asset(
     }
 
     let row = match kind {
-        "avatar" => sqlx::query("SELECT avatar_mime, avatar_data FROM servers WHERE id = ? LIMIT 1")
-            .bind(server_id)
-            .fetch_optional(pool)
-            .await?,
-        "banner" => sqlx::query("SELECT banner_mime, banner_data FROM servers WHERE id = ? LIMIT 1")
-            .bind(server_id)
-            .fetch_optional(pool)
-            .await?,
+        "avatar" => {
+            sqlx::query("SELECT avatar_mime, avatar_data FROM servers WHERE id = ? LIMIT 1")
+                .bind(server_id)
+                .fetch_optional(pool)
+                .await?
+        }
+        "banner" => {
+            sqlx::query("SELECT banner_mime, banner_data FROM servers WHERE id = ? LIMIT 1")
+                .bind(server_id)
+                .fetch_optional(pool)
+                .await?
+        }
         _ => return Ok(None),
     };
     let asset = row.and_then(|r| {
@@ -1947,7 +2309,10 @@ async fn clear_server_asset(
     Ok(())
 }
 
-async fn load_channel_permissions(pool: &SqlitePool, channel_id: &str) -> Result<Vec<ChannelPermissionResponse>, sqlx::Error> {
+async fn load_channel_permissions(
+    pool: &SqlitePool,
+    channel_id: &str,
+) -> Result<Vec<ChannelPermissionResponse>, sqlx::Error> {
     let rows = sqlx::query_as::<_, ChannelPermissionRecord>(
         "SELECT channel_id, role, can_view, can_send, can_manage, updated_at
          FROM channel_permissions
@@ -1985,7 +2350,10 @@ async fn load_channel_permission_record(
     .await
 }
 
-async fn load_server_roles(pool: &SqlitePool, server_id: &str) -> Result<Vec<ServerRoleResponse>, sqlx::Error> {
+async fn load_server_roles(
+    pool: &SqlitePool,
+    server_id: &str,
+) -> Result<Vec<ServerRoleResponse>, sqlx::Error> {
     let created_at = Utc::now();
     let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM server_roles WHERE server_id = ?")
         .bind(server_id)
@@ -2096,7 +2464,10 @@ async fn create_server_role_record(
     let base_id = slug_role_id(name);
     let suffix = Uuid::new_v4().simple().to_string();
     let role_id = format!("{}-{}", base_id, &suffix[..6]);
-    let color = payload.color.clone().unwrap_or_else(|| "#cbff00".to_string());
+    let color = payload
+        .color
+        .clone()
+        .unwrap_or_else(|| "#cbff00".to_string());
     let can_view = payload.can_view.unwrap_or(true) as i64;
     let can_send = payload.can_send.unwrap_or(true) as i64;
     let can_manage = payload.can_manage.unwrap_or(false) as i64;
@@ -2111,11 +2482,13 @@ async fn create_server_role_record(
     let can_voice = payload.can_voice.unwrap_or(true) as i64;
     let can_kick = payload.can_kick.unwrap_or(false) as i64;
     let can_ban = payload.can_ban.unwrap_or(false) as i64;
-    let position: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(position) + 1, 0) FROM server_roles WHERE server_id = ?")
-        .bind(server_id)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
+    let position: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(position) + 1, 0) FROM server_roles WHERE server_id = ?",
+    )
+    .bind(server_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
     sqlx::query(
         "INSERT INTO server_roles (server_id, role_id, name, color, can_view, can_send, can_manage, can_manage_channels, can_manage_roles, can_invite, can_attach, can_embed, can_react, can_pin, can_mention, can_voice, can_kick, can_ban, position, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -2176,13 +2549,21 @@ async fn update_server_role_record(
         Some(role) => role,
         None => return Err(sqlx::Error::RowNotFound),
     };
-    let next_name = if payload.name.trim().is_empty() { current.name } else { payload.name.trim().to_string() };
+    let next_name = if payload.name.trim().is_empty() {
+        current.name
+    } else {
+        payload.name.trim().to_string()
+    };
     let next_color = payload.color.clone().unwrap_or(current.color);
     let next_view = payload.can_view.unwrap_or(current.can_view != 0) as i64;
     let next_send = payload.can_send.unwrap_or(current.can_send != 0) as i64;
     let next_manage = payload.can_manage.unwrap_or(current.can_manage != 0) as i64;
-    let next_manage_channels = payload.can_manage_channels.unwrap_or(current.can_manage_channels != 0) as i64;
-    let next_manage_roles = payload.can_manage_roles.unwrap_or(current.can_manage_roles != 0) as i64;
+    let next_manage_channels = payload
+        .can_manage_channels
+        .unwrap_or(current.can_manage_channels != 0) as i64;
+    let next_manage_roles = payload
+        .can_manage_roles
+        .unwrap_or(current.can_manage_roles != 0) as i64;
     let next_invite = payload.can_invite.unwrap_or(current.can_invite != 0) as i64;
     let next_attach = payload.can_attach.unwrap_or(current.can_attach != 0) as i64;
     let next_embed = payload.can_embed.unwrap_or(current.can_embed != 0) as i64;
@@ -2325,30 +2706,14 @@ async fn can_access_channel(
             _ => false,
         });
     }
-    let (can_view, can_send, can_manage) = load_server_role_permissions(pool, server_id, role_key).await?;
+    let (can_view, can_send, can_manage) =
+        load_server_role_permissions(pool, server_id, role_key).await?;
     Ok(match action {
         "view" => can_view,
         "send" => can_send,
         "manage" => can_manage,
-    _ => false,
+        _ => false,
     })
-}
-
-async fn can_access_channel_fast(
-    pool: &SqlitePool,
-    server_id: &str,
-    channel_id: &str,
-    user: &str,
-    action: &str,
-) -> bool {
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        can_access_channel(pool, server_id, channel_id, user, action),
-    )
-    .await
-    .ok()
-    .and_then(|result| result.ok())
-    .unwrap_or(false)
 }
 
 async fn create_server_invite_record(
@@ -2395,10 +2760,11 @@ async fn get_server_member_role(
         return Ok(None);
     }
 
-    let server_owner: Option<String> = sqlx::query_scalar("SELECT owner FROM servers WHERE id = ? LIMIT 1")
-        .bind(server_id)
-        .fetch_optional(pool)
-        .await?;
+    let server_owner: Option<String> =
+        sqlx::query_scalar("SELECT owner FROM servers WHERE id = ? LIMIT 1")
+            .bind(server_id)
+            .fetch_optional(pool)
+            .await?;
 
     if server_owner.as_deref() == Some(username) {
         return Ok(Some("owner".to_string()));
@@ -2420,7 +2786,10 @@ async fn get_server_member_count(pool: &SqlitePool, server_id: &str) -> Result<i
         .await
 }
 
-async fn load_server_members(pool: &SqlitePool, server_id: &str) -> Result<Vec<ServerMemberResponse>, sqlx::Error> {
+async fn load_server_members(
+    pool: &SqlitePool,
+    server_id: &str,
+) -> Result<Vec<ServerMemberResponse>, sqlx::Error> {
     let rows = sqlx::query_as::<_, ServerMemberRecord>(
         "SELECT server_id, username, role, joined_at
          FROM server_members
@@ -2495,7 +2864,8 @@ async fn can_manage_server(
             return Ok(true);
         }
         if let Some(role_id) = role.as_deref() {
-            let (_can_view, _can_send, can_manage) = load_server_role_permissions(pool, server_id, role_id).await?;
+            let (_can_view, _can_send, can_manage) =
+                load_server_role_permissions(pool, server_id, role_id).await?;
             return Ok(can_manage);
         }
         return Ok(false);
@@ -2523,7 +2893,11 @@ async fn verify_password(password: String, hash: String) -> Result<bool, String>
 }
 
 async fn broadcast_json(state: &Arc<AppState>, payload: String) {
-    let viewers: Vec<String> = state.user_connections.iter().map(|entry| entry.key().clone()).collect();
+    let viewers: Vec<String> = state
+        .user_connections
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
     for viewer in viewers {
         send_payload_to_user(state, &viewer, payload.clone(), "broadcast_json").await;
     }
@@ -2613,7 +2987,12 @@ async fn send_json_to_user(state: &Arc<AppState>, username: &str, payload: serde
     }
 }
 
-fn voice_room_key(room_type: &str, server_id: Option<&str>, channel_id: Option<&str>, room_id: Option<&str>) -> String {
+fn voice_room_key(
+    room_type: &str,
+    server_id: Option<&str>,
+    channel_id: Option<&str>,
+    room_id: Option<&str>,
+) -> String {
     match room_type {
         "channel" => format!(
             "voice:channel:{}:{}",
@@ -2679,7 +3058,8 @@ async fn leave_voice_room(state: &Arc<AppState>, username: &str) {
         room_type = room.room_type.clone();
         room.participants.remove(username);
         remaining_participants = room.participants.iter().cloned().collect();
-        remove_room = room.participants.is_empty() || (room_type == "dm" && room.participants.len() <= 1);
+        remove_room =
+            room.participants.is_empty() || (room_type == "dm" && room.participants.len() <= 1);
     }
 
     if remove_room {
@@ -2712,7 +3092,10 @@ async fn join_voice_room(
     server_id: Option<&str>,
     channel_id: Option<&str>,
 ) {
-    info!("[VOICE] '{}' joining room {} ({})", username, room_id, room_type);
+    info!(
+        "[VOICE] '{}' joining room {} ({})",
+        username, room_id, room_type
+    );
     let should_leave_current_room = match state.user_voice_rooms.get(username) {
         Some(current_room) => current_room.value().as_str() != room_id,
         None => true,
@@ -2725,7 +3108,13 @@ async fn join_voice_room(
     let mut room = state
         .voice_rooms
         .entry(room_id.to_string())
-        .or_insert_with(|| VoiceRoom::new(room_type.to_string(), server_id.map(|v| v.to_string()), channel_id.map(|v| v.to_string())));
+        .or_insert_with(|| {
+            VoiceRoom::new(
+                room_type.to_string(),
+                server_id.map(|v| v.to_string()),
+                channel_id.map(|v| v.to_string()),
+            )
+        });
 
     {
         let room = room.value_mut();
@@ -2742,12 +3131,12 @@ async fn join_voice_room(
     broadcast_voice_room_state(state, room_id).await;
 }
 
-async fn route_voice_signal(
-    state: &Arc<AppState>,
-    sender: &str,
-    payload: &serde_json::Value,
-) {
-    let room_id = payload["roomId"].as_str().unwrap_or_default().trim().to_string();
+async fn route_voice_signal(state: &Arc<AppState>, sender: &str, payload: &serde_json::Value) {
+    let room_id = payload["roomId"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if room_id.is_empty() {
         return;
     }
@@ -2764,7 +3153,11 @@ async fn route_voice_signal(
     let mut signal = payload.clone();
     signal["from"] = serde_json::Value::String(sender.to_string());
 
-    if let Some(target) = payload["to"].as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    if let Some(target) = payload["to"]
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         let active_ws = state
             .user_connections
             .get(&target)
@@ -2809,11 +3202,7 @@ async fn route_voice_signal(
     }
 }
 
-async fn handle_voice_event(
-    state: &Arc<AppState>,
-    sender: &str,
-    payload: &serde_json::Value,
-) {
+async fn handle_voice_event(state: &Arc<AppState>, sender: &str, payload: &serde_json::Value) {
     let event_type = payload["type"].as_str().unwrap_or_default();
     info!(
         "[VOICE][EVENT] user={} type={} roomId={} roomType={} target={} inviter={} from={}",
@@ -2828,7 +3217,11 @@ async fn handle_voice_event(
     match event_type {
         "voice_join" => {
             let room_type = payload["roomType"].as_str().unwrap_or("channel");
-            let room_id = payload["roomId"].as_str().unwrap_or_default().trim().to_string();
+            let room_id = payload["roomId"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             let server_id = payload["serverId"].as_str().map(|s| s.trim().to_string());
             let channel_id = payload["channelId"].as_str().map(|s| s.trim().to_string());
             if room_id.is_empty() {
@@ -2845,7 +3238,10 @@ async fn handle_voice_event(
 
             if room_type == "channel" {
                 if let (Some(sid), Some(cid)) = (server_id.as_deref(), channel_id.as_deref()) {
-                    if !can_access_channel(&state.db, sid, cid, sender, "view").await.unwrap_or(false) {
+                    if !can_access_channel(&state.db, sid, cid, sender, "view")
+                        .await
+                        .unwrap_or(false)
+                    {
                         send_json_to_user(
                             state,
                             sender,
@@ -2879,8 +3275,16 @@ async fn handle_voice_event(
             route_voice_signal(state, sender, payload).await;
         }
         "voice_call_invite" => {
-            let target = payload["target"].as_str().unwrap_or_default().trim().to_string();
-            let room_id = payload["roomId"].as_str().unwrap_or_default().trim().to_string();
+            let target = payload["target"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let room_id = payload["roomId"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             let room_key = if room_id.is_empty() {
                 let mut pair = [sender.to_string(), target.clone()];
                 pair.sort();
@@ -2891,7 +3295,10 @@ async fn handle_voice_event(
             if target.is_empty() {
                 return;
             }
-            info!("[VOICE][INVITE] from={} to={} roomId={}", sender, target, room_key);
+            info!(
+                "[VOICE][INVITE] from={} to={} roomId={}",
+                sender, target, room_key
+            );
             send_json_to_user(
                 state,
                 &target,
@@ -2917,12 +3324,23 @@ async fn handle_voice_event(
             .await;
         }
         "voice_call_accept" => {
-            let inviter = payload["inviter"].as_str().unwrap_or_default().trim().to_string();
-            let room_id = payload["roomId"].as_str().unwrap_or_default().trim().to_string();
+            let inviter = payload["inviter"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let room_id = payload["roomId"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             if room_id.is_empty() || inviter.is_empty() {
                 return;
             }
-            info!("[VOICE] '{}' accepted call room={} inviter={}", sender, room_id, inviter);
+            info!(
+                "[VOICE] '{}' accepted call room={} inviter={}",
+                sender, room_id, inviter
+            );
 
             {
                 let mut room = state
@@ -2947,11 +3365,7 @@ async fn handle_voice_event(
 
             info!(
                 "[VOICE][ACCEPT] room={} sender={} inviter={} participants=[{},{}]",
-                room_id,
-                sender,
-                inviter,
-                sender,
-                inviter
+                room_id, sender, inviter, sender, inviter
             );
             let accepted_payload = serde_json::json!({
                 "type": "voice_call_accepted",
@@ -2971,15 +3385,29 @@ async fn handle_voice_event(
             });
             send_json_to_user(state, &inviter, connected_payload.clone()).await;
             send_json_to_user(state, sender, connected_payload).await;
-            info!("[VOICE][ACCEPT-DONE] room={} sender={} inviter={}", room_id, sender, inviter);
+            info!(
+                "[VOICE][ACCEPT-DONE] room={} sender={} inviter={}",
+                room_id, sender, inviter
+            );
         }
         "voice_call_reject" => {
-            let inviter = payload["inviter"].as_str().unwrap_or_default().trim().to_string();
-            let room_id = payload["roomId"].as_str().unwrap_or_default().trim().to_string();
+            let inviter = payload["inviter"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let room_id = payload["roomId"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             if room_id.is_empty() || inviter.is_empty() {
                 return;
             }
-            info!("[VOICE][REJECT] from={} to={} roomId={}", sender, inviter, room_id);
+            info!(
+                "[VOICE][REJECT] from={} to={} roomId={}",
+                sender, inviter, room_id
+            );
             send_json_to_user(
                 state,
                 &inviter,
@@ -2993,12 +3421,23 @@ async fn handle_voice_event(
             .await;
         }
         "voice_call_cancel" => {
-            let target = payload["target"].as_str().unwrap_or_default().trim().to_string();
-            let room_id = payload["roomId"].as_str().unwrap_or_default().trim().to_string();
+            let target = payload["target"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let room_id = payload["roomId"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             if room_id.is_empty() || target.is_empty() {
                 return;
             }
-            info!("[VOICE][CANCEL] from={} to={} roomId={}", sender, target, room_id);
+            info!(
+                "[VOICE][CANCEL] from={} to={} roomId={}",
+                sender, target, room_id
+            );
             send_json_to_user(
                 state,
                 &target,
@@ -3043,7 +3482,9 @@ async fn load_reaction_states(
         let message_id: String = row.get("message_id");
         let emoji: String = row.get("emoji");
         let reactor: String = row.get("reactor");
-        let entry = states.entry(message_id).or_insert_with(|| (HashMap::new(), None));
+        let entry = states
+            .entry(message_id)
+            .or_insert_with(|| (HashMap::new(), None));
         *entry.0.entry(emoji.clone()).or_insert(0) += 1;
         if reactor == viewer {
             entry.1 = Some(emoji);
@@ -3072,44 +3513,94 @@ async fn load_reaction_state(
     Ok(map.get(message_id).cloned().unwrap_or_default())
 }
 
-async fn broadcast_reaction_event(
+async fn load_reaction_state_for_viewers(
     state: &Arc<AppState>,
-    message: &Message,
-) {
-    let viewers: Vec<String> = if let (Some(server_id), Some(channel_id)) = (message.server_id.as_deref(), message.channel_id.as_deref()) {
-        let candidates: Vec<String> = state.user_connections.iter().map(|entry| entry.key().clone()).collect();
-        let mut allowed = Vec::with_capacity(candidates.len());
-        for viewer in candidates {
-            if can_access_channel_fast(&state.db, server_id, channel_id, &viewer, "view").await {
-                allowed.push(viewer);
+    message_id: &str,
+    viewers: &[String],
+) -> Result<(Vec<ReactionSummary>, HashMap<String, String>), sqlx::Error> {
+    let viewer_set: HashSet<&str> = viewers.iter().map(|viewer| viewer.as_str()).collect();
+    let rows = sqlx::query("SELECT emoji, reactor FROM reactions WHERE message_id = ?")
+        .bind(message_id)
+        .fetch_all(&state.db)
+        .await?;
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    let mut my_reactions: HashMap<String, String> = HashMap::new();
+    for row in rows {
+        let emoji: String = row.get("emoji");
+        let reactor: String = row.get("reactor");
+        *counts.entry(emoji.clone()).or_insert(0) += 1;
+        if viewer_set.contains(reactor.as_str()) {
+            my_reactions.insert(reactor, emoji);
+        }
+    }
+
+    let mut reactions: Vec<ReactionSummary> = counts
+        .into_iter()
+        .map(|(emoji, count)| ReactionSummary { emoji, count })
+        .collect();
+    reactions.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.emoji.cmp(&b.emoji)));
+    Ok((reactions, my_reactions))
+}
+
+async fn broadcast_reaction_event(state: &Arc<AppState>, message: &Message) {
+    let viewers: Vec<String> = if let (Some(server_id), Some(channel_id)) =
+        (message.server_id.as_deref(), message.channel_id.as_deref())
+    {
+        let candidates: Vec<String> = state
+            .user_connections
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        match get_server_accessibility(&state.db, server_id).await {
+            Ok(Some(server)) => {
+                match resolve_server_message_viewers(state, &server, channel_id, &candidates).await
+                {
+                    Ok(allowed) => allowed,
+                    Err(e) => {
+                        error!(
+                            "Ошибка предварительного расчёта зрителей реакции {} в {}/{}: {}",
+                            message.id, server_id, channel_id, e
+                        );
+                        return;
+                    }
+                }
+            }
+            Ok(None) => return,
+            Err(e) => {
+                error!(
+                    "Ошибка проверки сервера {} перед доставкой реакции {}: {}",
+                    server_id, message.id, e
+                );
+                return;
             }
         }
-        allowed
     } else if message.sender == message.receiver {
         vec![message.sender.clone()]
     } else {
         vec![message.sender.clone(), message.receiver.clone()]
     };
 
-    for viewer in viewers {
-        match load_reaction_state(state, &message.id, &viewer).await {
-            Ok((reactions, my_reaction)) => {
-                let payload = serde_json::json!({
-                    "type": "reaction_updated",
-                    "messageId": message.id,
-                    "sender": message.sender,
-                    "receiver": message.receiver,
-                    "serverId": message.server_id,
-                    "channelId": message.channel_id,
-                    "reactions": reactions,
-                    "myReaction": my_reaction
-                });
-                send_payload_to_user(state, &viewer, payload.to_string(), "reaction_updated").await;
-            }
+    let (reactions, my_reactions) =
+        match load_reaction_state_for_viewers(state, &message.id, &viewers).await {
+            Ok(state) => state,
             Err(e) => {
                 error!("Ошибка загрузки реакций для {}: {}", message.id, e);
+                return;
             }
-        }
+        };
+
+    for viewer in viewers {
+        let payload = serde_json::json!({
+            "type": "reaction_updated",
+            "messageId": message.id,
+            "sender": message.sender,
+            "receiver": message.receiver,
+            "serverId": message.server_id,
+            "channelId": message.channel_id,
+            "reactions": reactions,
+            "myReaction": my_reactions.get(&viewer).cloned()
+        });
+        send_payload_to_user(state, &viewer, payload.to_string(), "reaction_updated").await;
     }
 }
 
@@ -3201,7 +3692,10 @@ async fn register(
             .into_response();
     }
 
-    info!("Хэширование пароля для нового пользователя '{}'", payload.username);
+    info!(
+        "Хэширование пароля для нового пользователя '{}'",
+        payload.username
+    );
     let hashed = match hash_password(payload.password.clone()).await {
         Ok(h) => h,
         Err(e) => {
@@ -3252,10 +3746,14 @@ async fn login(
     let rate_key = payload.username.to_lowercase();
     let window = Duration::from_secs(state.config.rate_limit_window_secs);
     let max_attempts = state.config.rate_limit_max_attempts;
+    let now = Instant::now();
+    state.login_attempts.retain(|_, attempts| {
+        attempts.retain(|t| now.duration_since(*t) < window);
+        !attempts.is_empty()
+    });
 
     {
         let mut attempts = state.login_attempts.entry(rate_key.clone()).or_default();
-        let now = Instant::now();
         // Drop old entries outside the window
         attempts.retain(|t| now.duration_since(*t) < window);
         if attempts.len() >= max_attempts {
@@ -3275,7 +3773,11 @@ async fn login(
         if attempts.is_empty() {
             drop(attempts);
             state.login_attempts.remove(&rate_key);
-            state.login_attempts.entry(rate_key.clone()).or_default().push_back(now);
+            state
+                .login_attempts
+                .entry(rate_key.clone())
+                .or_default()
+                .push_back(now);
         } else {
             attempts.push_back(now);
         }
@@ -3358,7 +3860,12 @@ async fn get_contacts(
     .await
     {
         Ok(contacts) => {
-            info!("API get_contacts owner={} count={} contacts={}", owner, contacts.len(), contacts.join(","));
+            info!(
+                "API get_contacts owner={} count={} contacts={}",
+                owner,
+                contacts.len(),
+                contacts.join(",")
+            );
             Json(ContactListResponse { contacts }).into_response()
         }
         Err(e) => {
@@ -3383,12 +3890,11 @@ async fn add_contact(
         return (StatusCode::BAD_REQUEST, "Нельзя добавить самого себя").into_response();
     }
 
-    let exists = sqlx::query_scalar::<_, String>(
-        "SELECT username FROM users WHERE username = ? LIMIT 1",
-    )
-    .bind(contact)
-    .fetch_optional(&state.db)
-    .await;
+    let exists =
+        sqlx::query_scalar::<_, String>("SELECT username FROM users WHERE username = ? LIMIT 1")
+            .bind(contact)
+            .fetch_optional(&state.db)
+            .await;
 
     match exists {
         Ok(Some(_)) => {}
@@ -3422,7 +3928,10 @@ async fn delete_contact(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     AuthenticatedUser(owner): AuthenticatedUser,
 ) -> impl IntoResponse {
-    info!("API delete_contact start owner={} contact={}", owner, username);
+    info!(
+        "API delete_contact start owner={} contact={}",
+        owner, username
+    );
     if let Err(e) = sqlx::query("DELETE FROM contacts WHERE owner = ? AND contact = ?")
         .bind(&owner)
         .bind(&username)
@@ -3432,7 +3941,10 @@ async fn delete_contact(
         error!("Ошибка удаления контакта {} -> {}: {}", owner, username, e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    info!("API delete_contact removed owner={} contact={}", owner, username);
+    info!(
+        "API delete_contact removed owner={} contact={}",
+        owner, username
+    );
 
     get_contacts(axum::extract::State(state), AuthenticatedUser(owner))
         .await
@@ -3460,16 +3972,13 @@ async fn get_servers(
     .await
     {
         Ok(records) => {
-            let mut servers = Vec::with_capacity(records.len());
-            for record in records {
-                match build_server_response(&state.db, record, &auth_user).await {
-                    Ok(server) => servers.push(server),
-                    Err(e) => {
-                        error!("Ошибка сборки сервера: {}", e);
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
+            let servers = match build_server_responses_batch(&state.db, records, &auth_user).await {
+                Ok(servers) => servers,
+                Err(e) => {
+                    error!("Ошибка сборки серверов: {}", e);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
-            }
+            };
             Json(ServerListResponse { servers }).into_response()
         }
         Err(e) => {
@@ -3501,16 +4010,13 @@ async fn get_public_servers(
     .await
     {
         Ok(records) => {
-            let mut servers = Vec::with_capacity(records.len());
-            for record in records {
-                match build_server_response(&state.db, record, &auth_user).await {
-                    Ok(server) => servers.push(server),
-                    Err(e) => {
-                        error!("Ошибка сборки публичного сервера: {}", e);
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
+            let servers = match build_server_responses_batch(&state.db, records, &auth_user).await {
+                Ok(servers) => servers,
+                Err(e) => {
+                    error!("Ошибка сборки публичных серверов: {}", e);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
-            }
+            };
             Json(ServerListResponse { servers }).into_response()
         }
         Err(e) => {
@@ -3652,7 +4158,10 @@ async fn get_channels(
         }
     }
 
-    let channels = if can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    let channels = if can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         load_channels_for_server(&state.db, &server_id).await
     } else {
         load_visible_channels_for_server(&state.db, &server_id, &auth_user).await
@@ -3682,7 +4191,10 @@ async fn create_channel(
         }
     };
 
-    if !can_manage_server(&state.db, &server_id, &owner).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &owner)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -3690,8 +4202,15 @@ async fn create_channel(
     if channel_name.is_empty() {
         return (StatusCode::BAD_REQUEST, "Имя канала не может быть пустым").into_response();
     }
-    if channel_name_conflicts(&state.db, &server_id, channel_name, None).await.unwrap_or(false) {
-        return (StatusCode::BAD_REQUEST, "Канал с таким названием уже существует").into_response();
+    if channel_name_conflicts(&state.db, &server_id, channel_name, None)
+        .await
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Канал с таким названием уже существует",
+        )
+            .into_response();
     }
 
     if server.is_public == 0 {
@@ -3754,7 +4273,10 @@ async fn update_channel(
     AuthenticatedUser(auth_user): AuthenticatedUser,
     Json(payload): Json<ChannelUpdatePayload>,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -3792,7 +4314,11 @@ async fn update_channel(
             .await
             .unwrap_or(false)
     {
-        return (StatusCode::BAD_REQUEST, "Канал с таким названием уже существует").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "Канал с таким названием уже существует",
+        )
+            .into_response();
     }
 
     let next_topic = payload
@@ -3820,14 +4346,20 @@ async fn update_channel(
     .execute(&state.db)
     .await
     {
-        error!("Ошибка обновления канала {}/{}: {}", server_id, channel_id, e);
+        error!(
+            "Ошибка обновления канала {}/{}: {}",
+            server_id, channel_id, e
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     match load_channels_for_server(&state.db, &server_id).await {
         Ok(channels) => Json(channels).into_response(),
         Err(e) => {
-            error!("Ошибка перечитывания каналов {} после обновления {}: {}", server_id, channel_id, e);
+            error!(
+                "Ошибка перечитывания каналов {} после обновления {}: {}",
+                server_id, channel_id, e
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -3838,7 +4370,10 @@ async fn delete_channel(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     AuthenticatedUser(auth_user): AuthenticatedUser,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -3873,7 +4408,10 @@ async fn delete_channel(
     {
         Ok(rows) => rows,
         Err(e) => {
-            error!("Ошибка загрузки сообщений канала {}/{} перед удалением: {}", server_id, channel_id, e);
+            error!(
+                "Ошибка загрузки сообщений канала {}/{} перед удалением: {}",
+                server_id, channel_id, e
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -3886,7 +4424,10 @@ async fn delete_channel(
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
         Err(e) => {
-            error!("Ошибка начала транзакции удаления канала {}/{}: {}", server_id, channel_id, e);
+            error!(
+                "Ошибка начала транзакции удаления канала {}/{}: {}",
+                server_id, channel_id, e
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -3906,7 +4447,10 @@ async fn delete_channel(
         .execute(&mut *tx)
         .await
     {
-        error!("Ошибка удаления сообщений канала {}/{}: {}", server_id, channel_id, e);
+        error!(
+            "Ошибка удаления сообщений канала {}/{}: {}",
+            server_id, channel_id, e
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     if let Err(e) = sqlx::query("DELETE FROM channel_permissions WHERE channel_id = ?")
@@ -3914,7 +4458,10 @@ async fn delete_channel(
         .execute(&mut *tx)
         .await
     {
-        error!("Ошибка удаления прав канала {}/{}: {}", server_id, channel_id, e);
+        error!(
+            "Ошибка удаления прав канала {}/{}: {}",
+            server_id, channel_id, e
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     if let Err(e) = sqlx::query("DELETE FROM channels WHERE server_id = ? AND id = ?")
@@ -3928,14 +4475,20 @@ async fn delete_channel(
     }
 
     if let Err(e) = tx.commit().await {
-        error!("Ошибка фиксации удаления канала {}/{} ({}): {}", server_id, channel_id, channel.name, e);
+        error!(
+            "Ошибка фиксации удаления канала {}/{} ({}): {}",
+            server_id, channel_id, channel.name, e
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     match load_channels_for_server(&state.db, &server_id).await {
         Ok(channels) => Json(channels).into_response(),
         Err(e) => {
-            error!("Ошибка перечитывания каналов {} после удаления {}: {}", server_id, channel_id, e);
+            error!(
+                "Ошибка перечитывания каналов {} после удаления {}: {}",
+                server_id, channel_id, e
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -3956,7 +4509,10 @@ async fn update_server(
         }
     };
 
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -3994,7 +4550,11 @@ async fn update_server(
         .map(str::to_string)
         .unwrap_or(server.join_link);
     let next_public = if let Some(is_public) = payload.is_public {
-        if is_public { 1 } else { 0 }
+        if is_public {
+            1
+        } else {
+            0
+        }
     } else {
         server.is_public
     };
@@ -4019,12 +4579,28 @@ async fn update_server(
     }
 
     if let Some(avatar_data_url) = payload.avatar_data_url.as_deref() {
-        if let Err(e) = set_server_asset(&state.db, &state.data_dir, &server_id, "avatar", avatar_data_url).await {
+        if let Err(e) = set_server_asset(
+            &state.db,
+            &state.data_dir,
+            &server_id,
+            "avatar",
+            avatar_data_url,
+        )
+        .await
+        {
             error!("Ошибка обновления аватара сервера {}: {}", server_id, e);
         }
     }
     if let Some(banner_data_url) = payload.banner_data_url.as_deref() {
-        if let Err(e) = set_server_asset(&state.db, &state.data_dir, &server_id, "banner", banner_data_url).await {
+        if let Err(e) = set_server_asset(
+            &state.db,
+            &state.data_dir,
+            &server_id,
+            "banner",
+            banner_data_url,
+        )
+        .await
+        {
             error!("Ошибка обновления баннера сервера {}: {}", server_id, e);
         }
     }
@@ -4050,7 +4626,10 @@ async fn get_server_members(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     AuthenticatedUser(auth_user): AuthenticatedUser,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -4069,7 +4648,10 @@ async fn add_server_member(
     AuthenticatedUser(auth_user): AuthenticatedUser,
     Json(payload): Json<ServerMemberPayload>,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -4084,13 +4666,22 @@ async fn add_server_member(
 
     let username = payload.username.trim();
     if username.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Имя участника не может быть пустым").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "Имя участника не может быть пустым",
+        )
+            .into_response();
     }
     if username == server.owner {
-        return (StatusCode::BAD_REQUEST, "Владелец уже является участником сервера").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "Владелец уже является участником сервера",
+        )
+            .into_response();
     }
 
-    let role = match resolve_member_role_input(&state.db, &server_id, payload.role.as_deref()).await {
+    let role = match resolve_member_role_input(&state.db, &server_id, payload.role.as_deref()).await
+    {
         Ok(role) => role,
         Err(_) => return (StatusCode::BAD_REQUEST, "Неизвестная роль").into_response(),
     };
@@ -4098,14 +4689,20 @@ async fn add_server_member(
         return (StatusCode::BAD_REQUEST, "Нельзя назначить роль владельца").into_response();
     }
     if let Err(e) = ensure_server_member(&state.db, &server_id, username, &role).await {
-        error!("Ошибка добавления участника {} в сервер {}: {}", username, server_id, e);
+        error!(
+            "Ошибка добавления участника {} в сервер {}: {}",
+            username, server_id, e
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     match load_server_members(&state.db, &server_id).await {
         Ok(members) => Json(serde_json::json!({ "members": members })).into_response(),
         Err(e) => {
-            error!("Ошибка перечитывания участников сервера {}: {}", server_id, e);
+            error!(
+                "Ошибка перечитывания участников сервера {}: {}",
+                server_id, e
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -4117,7 +4714,10 @@ async fn update_server_member(
     AuthenticatedUser(auth_user): AuthenticatedUser,
     Json(payload): Json<ServerMemberPayload>,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -4132,13 +4732,18 @@ async fn update_server_member(
 
     let target = username.trim();
     if target.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Имя участника не может быть пустым").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "Имя участника не может быть пустым",
+        )
+            .into_response();
     }
     if target == server.owner {
         return (StatusCode::BAD_REQUEST, "Роль владельца изменить нельзя").into_response();
     }
 
-    let role = match resolve_member_role_input(&state.db, &server_id, payload.role.as_deref()).await {
+    let role = match resolve_member_role_input(&state.db, &server_id, payload.role.as_deref()).await
+    {
         Ok(role) => role,
         Err(_) => return (StatusCode::BAD_REQUEST, "Неизвестная роль").into_response(),
     };
@@ -4146,14 +4751,20 @@ async fn update_server_member(
         return (StatusCode::BAD_REQUEST, "Нельзя назначить роль владельца").into_response();
     }
     if let Err(e) = ensure_server_member(&state.db, &server_id, target, &role).await {
-        error!("Ошибка обновления роли участника {} в сервере {}: {}", target, server_id, e);
+        error!(
+            "Ошибка обновления роли участника {} в сервере {}: {}",
+            target, server_id, e
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     match load_server_members(&state.db, &server_id).await {
         Ok(members) => Json(serde_json::json!({ "members": members })).into_response(),
         Err(e) => {
-            error!("Ошибка перечитывания участников сервера {}: {}", server_id, e);
+            error!(
+                "Ошибка перечитывания участников сервера {}: {}",
+                server_id, e
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -4164,7 +4775,10 @@ async fn delete_server_member(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     AuthenticatedUser(auth_user): AuthenticatedUser,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -4179,7 +4793,11 @@ async fn delete_server_member(
 
     let target = username.trim();
     if target.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Имя участника не может быть пустым").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "Имя участника не может быть пустым",
+        )
+            .into_response();
     }
     if target == server.owner {
         return (StatusCode::BAD_REQUEST, "Владельца нельзя удалить").into_response();
@@ -4191,14 +4809,20 @@ async fn delete_server_member(
         .execute(&state.db)
         .await
     {
-        error!("Ошибка удаления участника {} из сервера {}: {}", target, server_id, e);
+        error!(
+            "Ошибка удаления участника {} из сервера {}: {}",
+            target, server_id, e
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     match load_server_members(&state.db, &server_id).await {
         Ok(members) => Json(serde_json::json!({ "members": members })).into_response(),
         Err(e) => {
-            error!("Ошибка перечитывания участников сервера {}: {}", server_id, e);
+            error!(
+                "Ошибка перечитывания участников сервера {}: {}",
+                server_id, e
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -4233,7 +4857,10 @@ async fn delete_server(
     {
         Ok(rows) => rows,
         Err(e) => {
-            error!("Ошибка загрузки сообщений сервера {} перед удалением: {}", server_id, e);
+            error!(
+                "Ошибка загрузки сообщений сервера {} перед удалением: {}",
+                server_id, e
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -4246,15 +4873,20 @@ async fn delete_server(
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
         Err(e) => {
-            error!("Ошибка начала транзакции удаления сервера {}: {}", server_id, e);
+            error!(
+                "Ошибка начала транзакции удаления сервера {}: {}",
+                server_id, e
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
 
-    if let Err(e) = sqlx::query("DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE server_id = ?)")
-        .bind(&server_id)
-        .execute(&mut *tx)
-        .await
+    if let Err(e) = sqlx::query(
+        "DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE server_id = ?)",
+    )
+    .bind(&server_id)
+    .execute(&mut *tx)
+    .await
     {
         error!("Ошибка удаления реакций сервера {}: {}", server_id, e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -4305,7 +4937,10 @@ async fn get_server_roles(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     AuthenticatedUser(auth_user): AuthenticatedUser,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -4324,7 +4959,10 @@ async fn create_server_role(
     AuthenticatedUser(auth_user): AuthenticatedUser,
     Json(payload): Json<ServerRolePayload>,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -4343,14 +4981,20 @@ async fn update_server_role(
     AuthenticatedUser(auth_user): AuthenticatedUser,
     Json(payload): Json<ServerRolePayload>,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
     match update_server_role_record(&state.db, &server_id, &role_id, &payload).await {
         Ok(role) => Json(role).into_response(),
         Err(e) => {
-            error!("Ошибка обновления роли {} в сервере {}: {}", role_id, server_id, e);
+            error!(
+                "Ошибка обновления роли {} в сервере {}: {}",
+                role_id, server_id, e
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -4361,14 +5005,20 @@ async fn delete_server_role(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     AuthenticatedUser(auth_user): AuthenticatedUser,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
     match delete_server_role_record(&state.db, &server_id, &role_id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            error!("Ошибка удаления роли {} в сервере {}: {}", role_id, server_id, e);
+            error!(
+                "Ошибка удаления роли {} в сервере {}: {}",
+                role_id, server_id, e
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -4383,7 +5033,10 @@ async fn get_server_avatar(
         Ok(Some(_)) => {}
         Ok(None) => return StatusCode::FORBIDDEN.into_response(),
         Err(e) => {
-            error!("Ошибка проверки доступа к аватару сервера {}: {}", server_id, e);
+            error!(
+                "Ошибка проверки доступа к аватару сервера {}: {}",
+                server_id, e
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
@@ -4392,7 +5045,10 @@ async fn get_server_avatar(
         Ok(Some((mime, data))) => (
             [
                 (axum::http::header::CONTENT_TYPE, mime.as_str()),
-                (axum::http::header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "no-store, no-cache, must-revalidate",
+                ),
                 (axum::http::header::PRAGMA, "no-cache"),
             ],
             data,
@@ -4412,13 +5068,24 @@ async fn set_server_avatar(
     AuthenticatedUser(auth_user): AuthenticatedUser,
     Json(payload): Json<ServerAssetPayload>,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     if payload.data_url.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "data_url обязателен").into_response();
     }
-    if let Err(e) = set_server_asset(&state.db, &state.data_dir, &server_id, "avatar", &payload.data_url).await {
+    if let Err(e) = set_server_asset(
+        &state.db,
+        &state.data_dir,
+        &server_id,
+        "avatar",
+        &payload.data_url,
+    )
+    .await
+    {
         error!("Ошибка сохранения аватара сервера {}: {}", server_id, e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -4430,7 +5097,10 @@ async fn delete_server_avatar(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     AuthenticatedUser(auth_user): AuthenticatedUser,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     if let Err(e) = clear_server_asset(&state.db, &state.data_dir, &server_id, "avatar").await {
@@ -4449,7 +5119,10 @@ async fn get_server_banner(
         Ok(Some(_)) => {}
         Ok(None) => return StatusCode::FORBIDDEN.into_response(),
         Err(e) => {
-            error!("Ошибка проверки доступа к баннеру сервера {}: {}", server_id, e);
+            error!(
+                "Ошибка проверки доступа к баннеру сервера {}: {}",
+                server_id, e
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
@@ -4458,7 +5131,10 @@ async fn get_server_banner(
         Ok(Some((mime, data))) => (
             [
                 (axum::http::header::CONTENT_TYPE, mime.as_str()),
-                (axum::http::header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "no-store, no-cache, must-revalidate",
+                ),
                 (axum::http::header::PRAGMA, "no-cache"),
             ],
             data,
@@ -4478,13 +5154,24 @@ async fn set_server_banner(
     AuthenticatedUser(auth_user): AuthenticatedUser,
     Json(payload): Json<ServerAssetPayload>,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     if payload.data_url.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "data_url обязателен").into_response();
     }
-    if let Err(e) = set_server_asset(&state.db, &state.data_dir, &server_id, "banner", &payload.data_url).await {
+    if let Err(e) = set_server_asset(
+        &state.db,
+        &state.data_dir,
+        &server_id,
+        "banner",
+        &payload.data_url,
+    )
+    .await
+    {
         error!("Ошибка сохранения баннера сервера {}: {}", server_id, e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -4496,7 +5183,10 @@ async fn delete_server_banner(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     AuthenticatedUser(auth_user): AuthenticatedUser,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     if let Err(e) = clear_server_asset(&state.db, &state.data_dir, &server_id, "banner").await {
@@ -4511,7 +5201,10 @@ async fn get_server_invites(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     AuthenticatedUser(auth_user): AuthenticatedUser,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -4554,11 +5247,22 @@ async fn create_server_invite(
     AuthenticatedUser(auth_user): AuthenticatedUser,
     Json(payload): Json<InvitePayload>,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     let max_uses = payload.max_uses.unwrap_or(0).max(0);
-    match create_server_invite_record(&state.db, &server_id, &auth_user, max_uses, payload.expires_hours).await {
+    match create_server_invite_record(
+        &state.db,
+        &server_id,
+        &auth_user,
+        max_uses,
+        payload.expires_hours,
+    )
+    .await
+    {
         Ok(invite) => Json(ServerInviteResponse {
             url: format!("zali://invite/{}", invite.code),
             serverId: invite.server_id,
@@ -4613,7 +5317,10 @@ async fn join_server_invite(
     }
 
     if let Err(e) = ensure_server_member(&state.db, &invite.server_id, &auth_user, "member").await {
-        error!("Ошибка добавления пользователя {} по инвайту {}: {}", auth_user, code, e);
+        error!(
+            "Ошибка добавления пользователя {} по инвайту {}: {}",
+            auth_user, code, e
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -4665,7 +5372,10 @@ async fn join_server_link(
     };
 
     if let Err(e) = ensure_server_member(&state.db, &server.id, &auth_user, "member").await {
-        error!("Ошибка добавления пользователя {} по ссылке сервера {}: {}", auth_user, server.id, e);
+        error!(
+            "Ошибка добавления пользователя {} по ссылке сервера {}: {}",
+            auth_user, server.id, e
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -4677,7 +5387,10 @@ async fn get_channel_permissions(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     AuthenticatedUser(auth_user): AuthenticatedUser,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     match load_channel_permissions(&state.db, &channel_id).await {
@@ -4695,7 +5408,10 @@ async fn update_channel_permissions(
     AuthenticatedUser(auth_user): AuthenticatedUser,
     Json(payload): Json<ChannelPermissionsPayload>,
 ) -> impl IntoResponse {
-    if !can_manage_server(&state.db, &server_id, &auth_user).await.unwrap_or(false) {
+    if !can_manage_server(&state.db, &server_id, &auth_user)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     match upsert_channel_permissions(&state.db, &channel_id, &payload.permissions).await {
@@ -4719,7 +5435,10 @@ async fn get_server_messages(
     AuthenticatedUser(auth_user): AuthenticatedUser,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    info!("API get_server_messages start server={} channel={} auth={}", server_id, channel_id, auth_user);
+    info!(
+        "API get_server_messages start server={} channel={} auth={}",
+        server_id, channel_id, auth_user
+    );
     match get_server_access_context(&state.db, &server_id, &auth_user).await {
         Ok(Some(_)) => {}
         Ok(None) => return StatusCode::FORBIDDEN.into_response(),
@@ -4728,7 +5447,10 @@ async fn get_server_messages(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
-    if !can_access_channel(&state.db, &server_id, &channel_id, &auth_user, "view").await.unwrap_or(false) {
+    if !can_access_channel(&state.db, &server_id, &channel_id, &auth_user, "view")
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -4756,8 +5478,7 @@ async fn get_server_messages(
         .bind(&server_id)
         .bind(&channel_id)
     };
-    match query.fetch_all(&state.db).await
-    {
+    match query.fetch_all(&state.db).await {
         Ok(msgs) => {
             info!(
                 "API get_server_messages rows server={} channel={} auth={} count={}",
@@ -4780,11 +5501,14 @@ async fn get_server_messages(
                 }
             }
             let ids: Vec<String> = available_msgs.iter().map(|m| m.id.clone()).collect();
-            let reaction_states = load_reaction_states(&state, &ids, &auth_user).await.unwrap_or_default();
+            let reaction_states = load_reaction_states(&state, &ids, &auth_user)
+                .await
+                .unwrap_or_default();
             let response: Vec<MessageResponse> = available_msgs
                 .into_iter()
                 .map(|msg| {
-                    let (reactions, my_reaction) = reaction_states.get(&msg.id).cloned().unwrap_or_default();
+                    let (reactions, my_reaction) =
+                        reaction_states.get(&msg.id).cloned().unwrap_or_default();
                     MessageResponse {
                         id: msg.id,
                         client_id: msg.client_id,
@@ -4802,7 +5526,10 @@ async fn get_server_messages(
             Json(response).into_response()
         }
         Err(e) => {
-            error!("Ошибка получения сообщений сервера {}/{}: {}", server_id, channel_id, e);
+            error!(
+                "Ошибка получения сообщений сервера {}/{}: {}",
+                server_id, channel_id, e
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -4847,8 +5574,7 @@ async fn get_messages(
         .bind(&effective_user)
         .bind(&effective_user)
     };
-    match query.fetch_all(&state.db).await
-    {
+    match query.fetch_all(&state.db).await {
         Ok(msgs) => {
             info!(
                 "API get_messages rows user={} count={} db={} uploads={}",
@@ -4877,7 +5603,8 @@ async fn get_messages(
             let response: Vec<MessageResponse> = available_msgs
                 .into_iter()
                 .map(|msg| {
-                    let (reactions, my_reaction) = reaction_states.get(&msg.id).cloned().unwrap_or_default();
+                    let (reactions, my_reaction) =
+                        reaction_states.get(&msg.id).cloned().unwrap_or_default();
                     MessageResponse {
                         id: msg.id,
                         client_id: msg.client_id,
@@ -4916,12 +5643,13 @@ async fn set_message_reaction(
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let allowed = can_access_message(&state, &message, &auth_user).await.unwrap_or(false);
+    let allowed = can_access_message(&state, &message, &auth_user)
+        .await
+        .unwrap_or(false);
     if !allowed {
         warn!(
             "Попытка поставить реакцию к чужому сообщению: {} → {}",
-            auth_user,
-            id
+            auth_user, id
         );
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -4954,7 +5682,10 @@ async fn set_message_reaction(
     };
 
     if let Err(e) = result {
-        error!("Ошибка сохранения реакции {} на сообщение {}: {}", auth_user, id, e);
+        error!(
+            "Ошибка сохранения реакции {} на сообщение {}: {}",
+            auth_user, id, e
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -4989,7 +5720,10 @@ async fn get_avatar(
         return (
             [
                 (axum::http::header::CONTENT_TYPE, mime.as_str()),
-                (axum::http::header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "no-store, no-cache, must-revalidate",
+                ),
                 (axum::http::header::PRAGMA, "no-cache"),
             ],
             data,
@@ -5016,7 +5750,10 @@ async fn get_avatar(
             (
                 [
                     (axum::http::header::CONTENT_TYPE, avatar.mime_type.as_str()),
-                    (axum::http::header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+                    (
+                        axum::http::header::CACHE_CONTROL,
+                        "no-store, no-cache, must-revalidate",
+                    ),
                     (axum::http::header::PRAGMA, "no-cache"),
                 ],
                 avatar.data,
@@ -5072,7 +5809,11 @@ async fn upload_avatar(
         return (StatusCode::BAD_REQUEST, "Аватар должен быть изображением").into_response();
     }
     if file_data.len() > 2 * 1024 * 1024 {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "Аватар слишком большой (макс. 2 МБ)").into_response();
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Аватар слишком большой (макс. 2 МБ)",
+        )
+            .into_response();
     }
 
     let updated_at = Utc::now();
@@ -5114,7 +5855,8 @@ async fn upload_avatar(
             .into_response()
         }
         Err(e) => {
-            let _ = clear_asset_file(user_avatar_asset_dir(&state.data_dir, &username), "avatar").await;
+            let _ =
+                clear_asset_file(user_avatar_asset_dir(&state.data_dir, &username), "avatar").await;
             error!("Ошибка сохранения аватара {}: {}", username, e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -5188,7 +5930,14 @@ async fn upload_server_message(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     multipart: Multipart,
 ) -> impl IntoResponse {
-    upload_message_with_context(auth_user, state, multipart, Some(server_id), Some(channel_id)).await
+    upload_message_with_context(
+        auth_user,
+        state,
+        multipart,
+        Some(server_id),
+        Some(channel_id),
+    )
+    .await
 }
 
 async fn upload_message_with_context(
@@ -5302,19 +6051,34 @@ async fn upload_message_with_context(
     }
 
     let is_server_message = !server_id.trim().is_empty() || !channel_id.trim().is_empty();
-    let server_id_opt = if is_server_message { Some(server_id.trim().to_string()) } else { None };
-    let channel_id_opt = if is_server_message { Some(channel_id.trim().to_string()) } else { None };
+    let server_id_opt = if is_server_message {
+        Some(server_id.trim().to_string())
+    } else {
+        None
+    };
+    let channel_id_opt = if is_server_message {
+        Some(channel_id.trim().to_string())
+    } else {
+        None
+    };
 
     if is_server_message {
         let sid = server_id_opt.as_deref().unwrap_or_default();
         let cid = channel_id_opt.as_deref().unwrap_or_default();
         if sid.is_empty() || cid.is_empty() {
             warn!("UPLOAD rejected empty server/channel after override");
-            return (StatusCode::BAD_REQUEST, "Для серверного сообщения нужны server_id и channel_id").into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                "Для серверного сообщения нужны server_id и channel_id",
+            )
+                .into_response();
         }
         match get_server_access_context(&state.db, sid, &auth_user).await {
             Ok(Some((_server, _role))) => {
-                if !can_access_channel(&state.db, sid, cid, &auth_user, "send").await.unwrap_or(false) {
+                if !can_access_channel(&state.db, sid, cid, &auth_user, "send")
+                    .await
+                    .unwrap_or(false)
+                {
                     return StatusCode::FORBIDDEN.into_response();
                 }
             }
@@ -5403,14 +6167,21 @@ async fn upload_message_with_context(
             }
             Ok(None) => {}
             Err(e) => {
-                error!("Ошибка проверки client_id={} перед вставкой: {}", client_id, e);
+                error!(
+                    "Ошибка проверки client_id={} перед вставкой: {}",
+                    client_id, e
+                );
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
     }
 
     if let Err(e) = fs::write(&temp_path, &file_data).await {
-        error!("Ошибка записи временного файла {}: {}", temp_path.display(), e);
+        error!(
+            "Ошибка записи временного файла {}: {}",
+            temp_path.display(),
+            e
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -5463,7 +6234,11 @@ async fn upload_message_with_context(
 
             let msg = Message {
                 id: id.clone(),
-                client_id: if client_id.is_empty() { None } else { Some(client_id.clone()) },
+                client_id: if client_id.is_empty() {
+                    None
+                } else {
+                    Some(client_id.clone())
+                },
                 sender: sender.clone(),
                 receiver: receiver.clone(),
                 filename,
@@ -5476,10 +6251,16 @@ async fn upload_message_with_context(
                 info!("UPLOAD delivering server message id={}", msg.id);
                 deliver_server_message(&state, &msg).await;
             } else {
-                info!("UPLOAD delivering dm id={} to receiver={} sender={}", msg.id, receiver, sender);
+                info!(
+                    "UPLOAD delivering dm id={} to receiver={} sender={}",
+                    msg.id, receiver, sender
+                );
                 deliver_to_user(&state, &receiver, &msg).await;
                 if sender != receiver {
-                    info!("UPLOAD delivering dm echo id={} to sender={}", msg.id, sender);
+                    info!(
+                        "UPLOAD delivering dm echo id={} to sender={}",
+                        msg.id, sender
+                    );
                     deliver_to_user(&state, &sender, &msg).await;
                 }
             }
@@ -5494,7 +6275,11 @@ async fn upload_message_with_context(
                 msg.server_id,
                 msg.channel_id
             );
-            (StatusCode::CREATED, Json(serde_json::json!({ "id": msg.id, "clientId": msg.client_id }))).into_response()
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({ "id": msg.id, "clientId": msg.client_id })),
+            )
+                .into_response()
         }
         Err(e) => {
             let _ = fs::remove_file(&path).await;
@@ -5543,7 +6328,9 @@ async fn download_upload_file(
     .await
     {
         Ok(Some(message)) => {
-            let allowed = can_access_message(&state, &message, &auth_user).await.unwrap_or(false);
+            let allowed = can_access_message(&state, &message, &auth_user)
+                .await
+                .unwrap_or(false);
             if !allowed {
                 warn!(
                     "Несанкционированный доступ к uploads: {} пытается получить файл {}",
@@ -5594,9 +6381,7 @@ async fn deliver_to_user(state: &Arc<AppState>, username: &str, msg: &Message) {
         .unwrap_or(0);
     info!(
         "WS deliver_to_user start username={} message_id={} active_conns={}",
-        username,
-        msg.id,
-        active
+        username, msg.id, active
     );
     let payload = match serde_json::to_string(msg) {
         Ok(json) => json,
@@ -5609,20 +6394,22 @@ async fn deliver_to_user(state: &Arc<AppState>, username: &str, msg: &Message) {
     if sent > 0 {
         info!(
             "WS deliver_to_user done username={} message_id={} sent_conns={}",
-            username,
-            msg.id,
-            sent
+            username, msg.id, sent
         );
     } else {
         info!(
             "WS deliver_to_user skipped username={} message_id={} reason=no_connections",
-            username,
-            msg.id
+            username, msg.id
         );
     }
 }
 
-fn role_permissions_for_view(action: &str, can_view: bool, can_send: bool, can_manage: bool) -> bool {
+fn role_permissions_for_view(
+    action: &str,
+    can_view: bool,
+    can_send: bool,
+    can_manage: bool,
+) -> bool {
     match action {
         "view" => can_view,
         "send" => can_send,
@@ -5675,9 +6462,8 @@ async fn resolve_server_message_viewers(
         .collect();
 
     let mut member_roles = HashMap::new();
-    let mut builder = QueryBuilder::<Sqlite>::new(
-        "SELECT username, role FROM server_members WHERE server_id = ",
-    );
+    let mut builder =
+        QueryBuilder::<Sqlite>::new("SELECT username, role FROM server_members WHERE server_id = ");
     builder.push_bind(&server.id);
     builder.push(" AND username IN (");
     let mut separated = builder.separated(", ");
@@ -5736,7 +6522,11 @@ async fn deliver_server_message(state: &Arc<AppState>, msg: &Message) {
         return;
     };
 
-    let viewers: Vec<String> = state.user_connections.iter().map(|entry| entry.key().clone()).collect();
+    let viewers: Vec<String> = state
+        .user_connections
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
     info!(
         "WS deliver_server_message start message_id={} server={} channel={} viewers={}",
         msg.id,
@@ -5749,45 +6539,50 @@ async fn deliver_server_message(state: &Arc<AppState>, msg: &Message) {
         Ok(Some(server)) => server,
         Ok(None) => return,
         Err(e) => {
-            error!("Ошибка проверки доступа к серверу {} перед доставкой сообщения {}: {}", server_id, msg.id, e);
-            return;
-        }
-    };
-
-    let allowed_viewers = match resolve_server_message_viewers(state, &server, channel_id, &viewers).await {
-        Ok(list) => list,
-        Err(e) => {
             error!(
-                "Ошибка предварительного расчёта зрителей для сообщения {} в {}/{}: {}",
-                msg.id,
-                server_id,
-                channel_id,
-                e
+                "Ошибка проверки доступа к серверу {} перед доставкой сообщения {}: {}",
+                server_id, msg.id, e
             );
             return;
         }
     };
 
+    let allowed_viewers =
+        match resolve_server_message_viewers(state, &server, channel_id, &viewers).await {
+            Ok(list) => list,
+            Err(e) => {
+                error!(
+                    "Ошибка предварительного расчёта зрителей для сообщения {} в {}/{}: {}",
+                    msg.id, server_id, channel_id, e
+                );
+                return;
+            }
+        };
+
     for viewer in allowed_viewers {
-        let sent = send_payload_to_user(state, &viewer, payload.clone(), "deliver_server_message").await;
+        let sent =
+            send_payload_to_user(state, &viewer, payload.clone(), "deliver_server_message").await;
         if sent > 0 {
             info!(
                 "WS deliver_server_message sent viewer={} message_id={} conns={}",
-                viewer,
-                msg.id,
-                sent
+                viewer, msg.id, sent
             );
         }
     }
 }
 
-async fn can_access_message(state: &Arc<AppState>, msg: &Message, user: &str) -> Result<bool, sqlx::Error> {
+async fn can_access_message(
+    state: &Arc<AppState>,
+    msg: &Message,
+    user: &str,
+) -> Result<bool, sqlx::Error> {
     if msg.server_id.is_none() {
         return Ok(msg.sender == user || msg.receiver == user);
     }
 
     if let Some(server_id) = msg.server_id.as_deref() {
-        if let Some((server, _role)) = get_server_access_context(&state.db, server_id, user).await? {
+        if let Some((server, _role)) = get_server_access_context(&state.db, server_id, user).await?
+        {
             if server.owner == user || msg.sender == user {
                 return Ok(true);
             }
@@ -5801,7 +6596,11 @@ async fn can_access_message(state: &Arc<AppState>, msg: &Message, user: &str) ->
     Ok(false)
 }
 
-async fn can_delete_message(state: &Arc<AppState>, msg: &Message, user: &str) -> Result<bool, sqlx::Error> {
+async fn can_delete_message(
+    state: &Arc<AppState>,
+    msg: &Message,
+    user: &str,
+) -> Result<bool, sqlx::Error> {
     if msg.sender == user {
         return Ok(true);
     }
@@ -5845,7 +6644,9 @@ async fn download_message(
                 m.server_id,
                 m.channel_id
             );
-            let allowed = can_access_message(&state, &m, &auth_user).await.unwrap_or(false);
+            let allowed = can_access_message(&state, &m, &auth_user)
+                .await
+                .unwrap_or(false);
             if !allowed {
                 warn!(
                     "Несанкционированное скачивание: {} пытается получить сообщение {}",
@@ -5899,7 +6700,9 @@ async fn delete_message(
         .await
     {
         Ok(m) => {
-            let allowed = can_delete_message(&state, &m, &auth_user).await.unwrap_or(false);
+            let allowed = can_delete_message(&state, &m, &auth_user)
+                .await
+                .unwrap_or(false);
             if !allowed {
                 warn!("DELETE_MESSAGE forbidden id={} auth={}", id, auth_user);
                 return StatusCode::FORBIDDEN.into_response();
@@ -6052,7 +6855,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, username: St
         "[WS] '{}' отключился (active_ws={}, voice_room={:?})",
         username,
         if has_active_connections { 1 } else { 0 },
-        state.user_voice_rooms.get(&username).map(|v| v.value().clone())
+        state
+            .user_voice_rooms
+            .get(&username)
+            .map(|v| v.value().clone())
     );
 
     if !has_active_connections {
@@ -6066,10 +6872,16 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, username: St
                 .map(|conns| !conns.is_empty())
                 .unwrap_or(false);
             if still_connected {
-                info!("[VOICE] '{}' reconnect before delayed cleanup, skip leave", username_for_cleanup);
+                info!(
+                    "[VOICE] '{}' reconnect before delayed cleanup, skip leave",
+                    username_for_cleanup
+                );
                 return;
             }
-            info!("[VOICE] delayed cleanup for '{}' after ws close", username_for_cleanup);
+            info!(
+                "[VOICE] delayed cleanup for '{}' after ws close",
+                username_for_cleanup
+            );
             leave_voice_room(&state_for_cleanup, &username_for_cleanup).await;
         });
     }
